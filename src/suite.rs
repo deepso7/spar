@@ -11,12 +11,14 @@ use minip2p::PeerAddr;
 
 use crate::common::{
     avg, percentile, run_dial_collect, run_listen_loop, run_reconnect_once, sample_mem, DialOpts,
-    DialResult, MemSample, TransportKind, MAX_RTT_SAMPLES, STACK,
+    DialResult, MemSample, TransportKind, MAX_RTT_SAMPLES,
 };
 
 pub struct SuiteArgs {
     pub out_dir: PathBuf,
     pub deep: bool,
+    pub gossip: bool,
+    pub nat: bool,
     pub transport: TransportKind,
 }
 
@@ -30,18 +32,39 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
     fs::create_dir_all(&run_dir)?;
 
     let transport = args.transport;
+    let skip_echo = (args.gossip || args.nat) && !args.deep;
     let stop = Arc::new(AtomicBool::new(false));
-    let (addr_tx, addr_rx) = mpsc::channel::<PeerAddr>();
-    let stop_l = Arc::clone(&stop);
-    let listener = thread::Builder::new()
-        .name("spar-listen".into())
-        .spawn(move || run_listen_loop("127.0.0.1:0", transport, stop_l, addr_tx))?;
-    let addr = addr_rx.recv_timeout(Duration::from_secs(5))?;
-    eprintln!(
-        "[suite] listener ready at {addr} (deep={} transport={})",
-        args.deep,
-        transport.as_str()
-    );
+    let mut listener = None;
+    let mut listen_addr: Option<PeerAddr> = None;
+    if !skip_echo {
+        let (addr_tx, addr_rx) = mpsc::channel::<PeerAddr>();
+        let stop_l = Arc::clone(&stop);
+        listener = Some(
+            thread::Builder::new()
+                .name("spar-listen".into())
+                .spawn(move || run_listen_loop("127.0.0.1:0", transport, stop_l, addr_tx))?,
+        );
+        let addr = addr_rx.recv_timeout(Duration::from_secs(5))?;
+        eprintln!(
+            "[suite] listener ready at {addr} (deep={} gossip={} nat={} transport={})",
+            args.deep,
+            args.gossip,
+            args.nat,
+            transport.as_str()
+        );
+        listen_addr = Some(addr);
+    } else {
+        eprintln!(
+            "[suite] {}-only (transport={})",
+            match (args.gossip, args.nat) {
+                (true, true) => "gossip+nat",
+                (true, false) => "gossip",
+                (false, true) => "nat",
+                (false, false) => "echo",
+            },
+            transport.as_str()
+        );
+    }
 
     let suite_t0 = Instant::now();
     let mem_log: Arc<Mutex<Vec<(MemSample, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -68,7 +91,8 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
     let mut churn_mem_start: Option<MemSample> = None;
     let mut churn_mem_end: Option<MemSample> = None;
 
-    // --- short smoke (always) ---
+    if let Some(addr) = listen_addr.clone() {
+    // --- short smoke (always, unless --gossip/--nat without --deep) ---
     for (name, count, interval, payload, ping) in [
         ("baseline-echo-100x16B", 100, 0, 0, 0),
         ("builtin-ping-20", 0, 0, 0, 20),
@@ -191,6 +215,25 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
         results.extend(conc8);
     }
 
+    } // listen_addr
+
+    if args.gossip {
+        eprintln!("[suite] running gossip/pubsub scenarios …");
+        results.extend(crate::gossip::run_gossip_scenarios(
+            transport,
+            &mem_log,
+            suite_t0,
+        ));
+    }
+    if args.nat {
+        eprintln!("[suite] running NAT/circuit scenarios …");
+        results.extend(crate::nat::run_nat_scenarios(
+            transport,
+            &mem_log,
+            suite_t0,
+        ));
+    }
+
     record_mem(&mem_log, suite_t0, "suite-end");
     sampler_stop.store(true, Ordering::SeqCst);
     if let Some(h) = sampler {
@@ -200,7 +243,9 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
     let wall_ms = suite_t0.elapsed().as_millis() as u64;
     stop.store(true, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(200));
-    let _ = listener.join();
+    if let Some(h) = listener {
+        let _ = h.join();
+    }
 
     let mem_samples = mem_log.lock().unwrap().clone();
     let mem_csv = run_dir.join("memory.csv");
@@ -208,7 +253,19 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
 
     let md_path = run_dir.join("report.md");
     let json_path = run_dir.join("report.json");
-    let target = addr.to_string();
+    let target = match &listen_addr {
+        Some(a) => a.to_string(),
+        None => {
+            let mut parts = vec![format!("loopback {}", transport.as_str())];
+            if args.nat {
+                parts.push("nat/circuit".into());
+            }
+            if args.gossip {
+                parts.push(format!("gossipsub {}", crate::gossip::GOSSIP_TOPIC));
+            }
+            parts.join(" ")
+        }
+    };
     write_markdown(
         &md_path,
         &target,
@@ -216,6 +273,8 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
         &results,
         &mem_samples,
         args.deep,
+        args.gossip,
+        args.nat,
         transport,
         churn_mem_start.as_ref(),
         churn_mem_end.as_ref(),
@@ -227,6 +286,8 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
         &results,
         &mem_samples,
         args.deep,
+        args.gossip,
+        args.nat,
         transport,
         churn_mem_start.as_ref(),
         churn_mem_end.as_ref(),
@@ -238,7 +299,7 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
     println!(
         "[suite] wall_ms={wall_ms} scenarios={} mode={} transport={}",
         results.len(),
-        if args.deep { "deep" } else { "short" },
+        mode_label(args.deep, args.gossip, args.nat),
         transport.as_str()
     );
 
@@ -473,11 +534,29 @@ fn analyze_memory(
     }
 }
 
-fn mode_label(deep: bool) -> &'static str {
-    if deep {
+fn mode_label(deep: bool, gossip: bool, nat: bool) -> String {
+    let base = if deep {
         "deep"
+    } else if nat && gossip {
+        "nat+gossip"
+    } else if nat {
+        "nat"
+    } else if gossip {
+        "gossip"
     } else {
         "short"
+    };
+    if (gossip || nat) && deep {
+        let mut prefix = String::new();
+        if nat {
+            prefix.push_str("nat+");
+        }
+        if gossip {
+            prefix.push_str("gossip+");
+        }
+        format!("{prefix}{base}")
+    } else {
+        base.to_string()
     }
 }
 
@@ -488,6 +567,8 @@ fn write_markdown(
     results: &[DialResult],
     mem_samples: &[(MemSample, String)],
     deep: bool,
+    gossip: bool,
+    nat: bool,
     transport: TransportKind,
     churn_start: Option<&MemSample>,
     churn_end: Option<&MemSample>,
@@ -500,9 +581,9 @@ fn write_markdown(
     md.push_str("# spar soak report (minip2p)\n\n");
     md.push_str(&format!("- **Target:** `{target}`\n"));
     md.push_str("- **Runtime:** sync Rust only (`std::thread` / `mpsc`), no Tokio/async\n");
-    md.push_str(&format!("- **Stack:** `{STACK}`\n"));
+    md.push_str(&format!("- **Stack:** `{}`\n", transport.stack_label_with_features(gossip, nat)));
     md.push_str(&format!("- **Transport:** {}\n", transport.as_str()));
-    md.push_str(&format!("- **Mode:** {}\n", mode_label(deep)));
+    md.push_str(&format!("- **Mode:** {}\n", mode_label(deep, gossip, nat)));
     md.push_str(&format!(
         "- **Suite wall time:** {wall_ms} ms ({:.1} s)\n",
         wall_ms as f64 / 1000.0
@@ -558,7 +639,7 @@ fn write_markdown(
     md.push_str("\nNote: listener + all dialer Endpoints share one process PID; samples are from `/proc/self/status` (VmRSS / VmSize).\n");
 
     md.push_str("\n## Findings\n\n");
-    md.push_str(&findings(results, &mem, deep));
+    md.push_str(&findings(results, &mem, deep, gossip, nat));
     md.push_str("\n## Per-scenario detail\n\n");
     for r in results {
         md.push_str(&format!("### {}\n\n", r.name));
@@ -603,7 +684,7 @@ fn write_markdown(
     Ok(())
 }
 
-fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool) -> String {
+fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool, gossip: bool, nat: bool) -> String {
     let mut lines = Vec::new();
     let failed: Vec<_> = results.iter().filter(|r| !r.ok).collect();
     if failed.is_empty() {
@@ -676,6 +757,26 @@ fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool) -> String {
         ));
     }
 
+    for g in results.iter().filter(|r| r.name.starts_with("gossip-")) {
+        let rate = if g.wall_ms == 0 {
+            0.0
+        } else {
+            g.sent as f64 / (g.wall_ms as f64 / 1000.0)
+        };
+        lines.push(format!(
+            "- {}: ok={} expected_deliveries={} recv={} lost={} wall={}ms avg_delivery={:.1}µs p95={}µs ~{:.1} deliveries/s.",
+            g.name, g.ok, g.sent, g.received, g.lost, g.wall_ms, g.avg_echo_rtt_us(),
+            g.percentile_echo_rtt_us(0.95), rate
+        ));
+    }
+    for nsc in results.iter().filter(|r| r.name.starts_with("nat-")) {
+        lines.push(format!(
+            "- {}: ok={} sent={} recv={} lost={} wall={}ms avg_rtt={:.1}µs notes={}.",
+            nsc.name, nsc.ok, nsc.sent, nsc.received, nsc.lost, nsc.wall_ms,
+            nsc.avg_echo_rtt_us(), nsc.error.clone().unwrap_or_default()
+        ));
+    }
+
     lines.push("\n### Suspected bottlenecks\n".into());
     lines.push("- **Harness:** `FrameBuf::pop` returns a slice (no per-frame `.to_vec()`). Listener uses `HashMap<PeerId, HashSet<StreamId>>` and moves `data` into `send_stream`.".into());
     lines.push("- **Harness:** Endpoint-per-dial in reconnect churn is intentional (unique PeerId dial/drop). Each iter pays handshake + identify + stream open.".into());
@@ -691,7 +792,16 @@ fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool) -> String {
             ));
         }
     }
-    lines.push("- Caveat: loopback only — measures sync Endpoint under spar’s echo protocol (QUIC or TCP), not gossipsub/relay/WAN.".into());
+    if gossip {
+        lines.push("- Gossip scenarios drive all endpoints on one thread (round-robin `next_event` + `take_pubsub_events`); pubsub streams must not leak as app StreamReady.".into());
+        lines.push("- Caveat: loopback gossipsub only — mesh is a star (1 listener, N-1 dial). Not a WAN/relay mesh.".into());
+    }
+    if nat {
+        lines.push("- NAT scenarios drive application endpoints on one thread (round-robin `next_event`); the NAT agent is fed by that poll. `nat-nopath` is a pass when `ConnectFailed`/`NoPathAvailable`. Circuit uses a compact loopback hop (HOP/STOP + byte-copy). Loopback circuits stay Relayed.".into());
+    }
+    if !gossip && !nat {
+        lines.push("- Caveat: loopback only — measures sync Endpoint under spar’s echo protocol (QUIC or TCP), not gossipsub/relay/WAN.".into());
+    }
     lines.push('\n'.to_string());
     lines.join("\n")
 }
@@ -703,6 +813,8 @@ fn write_json(
     results: &[DialResult],
     mem_samples: &[(MemSample, String)],
     deep: bool,
+    gossip: bool,
+    nat: bool,
     transport: TransportKind,
     churn_start: Option<&MemSample>,
     churn_end: Option<&MemSample>,
@@ -712,10 +824,12 @@ fn write_json(
     s.push_str("{\n");
     s.push_str(&format!("  \"target\": \"{}\",\n", escape(target)));
     s.push_str("  \"runtime\": \"sync-std-thread\",\n");
-    s.push_str(&format!("  \"stack\": \"{}\",\n", escape(STACK)));
+    s.push_str(&format!("  \"stack\": \"{}\",\n", escape(transport.stack_label_with_features(gossip, nat))));
     s.push_str(&format!("  \"transport\": \"{}\",\n", transport.as_str()));
     s.push_str(&format!("  \"deep\": {},\n", deep));
-    s.push_str(&format!("  \"mode\": \"{}\",\n", mode_label(deep)));
+    s.push_str(&format!("  \"gossip\": {},\n", gossip));
+    s.push_str(&format!("  \"nat\": {},\n", nat));
+    s.push_str(&format!("  \"mode\": \"{}\",\n", mode_label(deep, gossip, nat)));
     s.push_str(&format!("  \"suite_wall_ms\": {wall_ms},\n"));
     s.push_str("  \"memory\": {\n");
     s.push_str(&format!("    \"start_rss_kb\": {},\n", mem.start_rss));

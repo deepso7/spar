@@ -29,6 +29,24 @@ impl TransportKind {
         }
     }
 
+    pub fn stack_label(self) -> String {
+        match self {
+            Self::Quic => format!("{STACK} (QUIC / quiche)"),
+            Self::Tcp => format!("{STACK} (TCP / Noise / Yamux)"),
+        }
+    }
+
+    pub fn stack_label_with_features(self, gossip: bool, nat: bool) -> String {
+        let mut base = self.stack_label();
+        if nat {
+            base.push_str(" + nat/circuit");
+        }
+        if gossip {
+            base.push_str(" + gossipsub");
+        }
+        base
+    }
+
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "quic" => Ok(Self::Quic),

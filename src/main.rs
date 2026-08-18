@@ -1,6 +1,9 @@
 //! spar — sync sparring harness for minip2p (no Tokio / no async).
 
 mod common;
+mod gossip;
+mod nat;
+mod relay;
 mod suite;
 
 use std::env;
@@ -134,13 +137,14 @@ spar — sync sparring harness for minip2p (no Tokio/async)
 Usage:
   spar [--transport quic|tcp] listen [--bind HOST:PORT]
   spar [--transport quic|tcp] dial <peer-multiaddr> [--count N] [--interval MS] [--payload N] [--builtin-ping N]
-  spar [--transport quic|tcp] suite [--out DIR] [--deep]
+  spar [--transport quic|tcp] suite [--out DIR] [--deep] [--gossip] [--nat]
 
   --transport quic|tcp   wire transport (default quic). Listener + dialers must match.
 
 Dial: --count N (5)  --interval MS (200)  --payload extra bytes (0)  --builtin-ping N (0)
 Suite writes reports/run-<stamp>/report.md, report.json, memory.csv
-Default is a short echo suite. --deep adds long echoes, reconnect-churn-200, 30s soak."
+Default is a short echo suite. --deep adds long echoes, reconnect-churn-200, 30s soak.
+--gossip / --nat add loopback gossipsub / NAT-circuit packs. Alone they skip the echo pack."
     );
 }
 
@@ -170,6 +174,8 @@ fn parse_suite(
 ) -> Result<SuiteArgs, String> {
     let mut out = PathBuf::from("reports");
     let mut deep = false;
+    let mut gossip = false;
+    let mut nat = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => {
@@ -179,6 +185,8 @@ fn parse_suite(
                     .ok_or_else(|| "--out needs a value".to_string())?;
             }
             "--deep" => deep = true,
+            "--gossip" => gossip = true,
+            "--nat" => nat = true,
             "--transport" => {
                 let v = args.next().ok_or_else(|| "--transport needs quic|tcp".to_string())?;
                 transport = TransportKind::parse(&v)?;
@@ -189,6 +197,8 @@ fn parse_suite(
     Ok(SuiteArgs {
         out_dir: out,
         deep,
+        gossip,
+        nat,
         transport,
     })
 }

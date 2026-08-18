@@ -800,6 +800,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eceecc48af2da4da9cbb38bc9a05c0e62388b88ecdb842a9bcbbbab08cd14cce"
 dependencies = [
+ "getrandom",
  "minip2p-circuit",
  "minip2p-core",
  "minip2p-discovery",
@@ -813,6 +814,7 @@ dependencies = [
  "minip2p-swarm",
  "minip2p-tcp",
  "minip2p-transport",
+ "thiserror",
 ]
 
 [[package]]
@@ -1269,6 +1271,7 @@ dependencies = [
 name = "spar"
 version = "0.1.0"
 dependencies = [
+ "minip2p-relay",
  "minip2p-rs",
 ]
 
