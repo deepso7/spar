@@ -1,0 +1,14 @@
+[package]
+name = "spar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Sync sparring harness for minip2p — soak tests and reports (no async)"
+
+[[bin]]
+name = "spar"
+path = "src/main.rs"
+
+[dependencies]
+minip2p-rs = { version = "0.4.1", default-features = false, features = ["std", "quic", "tcp", "pubsub", "nat"] }
+minip2p-relay = "0.4.1"

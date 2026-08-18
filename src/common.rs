@@ -1,0 +1,871 @@
+//! Shared sync helpers. No async, no Tokio.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::time::{Duration, Instant};
+
+use minip2p::{Ed25519Keypair, Endpoint, Event, PeerAddr, PeerId, StreamId};
+
+pub const AGENT: &str = "spar/0.1.0";
+/// Crate version of the sparred stack (minip2p-rs from crates.io).
+pub const STACK: &str = "minip2p-rs 0.4.1";
+pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
+pub const FRAME_LEN: usize = 16;
+pub const MAX_RTT_SAMPLES: usize = 50_000;
+
+/// Wire transport for listen/dial/suite (must match on both sides).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportKind {
+    #[default]
+    Quic,
+    Tcp,
+}
+
+impl TransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quic => "quic",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    /// Report label for the security/mux stack.
+    pub fn stack_label(self) -> String {
+        match self {
+            Self::Quic => format!("{STACK} (QUIC / quiche)"),
+            Self::Tcp => format!("{STACK} (TCP / Noise / Yamux)"),
+        }
+    }
+
+    /// Stack label, with gossipsub when those scenarios ran.
+    #[allow(dead_code)]
+    pub fn stack_label_with_gossip(self, gossip: bool) -> String {
+        self.stack_label_with_features(gossip, false)
+    }
+
+    /// Stack label including optional gossipsub and nat/circuit extras.
+    pub fn stack_label_with_features(self, gossip: bool, nat: bool) -> String {
+        let mut base = self.stack_label();
+        if nat {
+            base.push_str(" + nat/circuit");
+        }
+        if gossip {
+            base.push_str(" + gossipsub");
+        }
+        base
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "quic" => Ok(Self::Quic),
+            "tcp" => Ok(Self::Tcp),
+            other => Err(format!("unknown --transport {other:?} (want quic|tcp)")),
+        }
+    }
+}
+
+pub fn build_endpoint(
+    bind: Option<&str>,
+    transport: TransportKind,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    build_endpoint_identity(bind, transport, None)
+}
+
+/// Bind a loopback Endpoint, optionally reusing a host key (same PeerId / supersede).
+pub fn build_endpoint_identity(
+    bind: Option<&str>,
+    transport: TransportKind,
+    identity: Option<Ed25519Keypair>,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = bind.unwrap_or("127.0.0.1:0");
+    let mut builder = Endpoint::builder()
+        .agent_version(AGENT)
+        .protocol(ECHO_PROTOCOL);
+    if let Some(kp) = identity {
+        builder = builder.identity(kp);
+    }
+    let endpoint = match transport {
+        TransportKind::Quic => builder.bind_quic(addr)?,
+        TransportKind::Tcp => builder.bind_tcp(addr)?,
+    };
+    Ok(endpoint)
+}
+
+pub fn encode_header(seq: u64, send_ms: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_LEN);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&send_ms.to_be_bytes());
+    out
+}
+
+pub fn decode_header(bytes: &[u8]) -> (u64, u64) {
+    let seq = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+    let send_ms = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+    (seq, send_ms)
+}
+
+pub fn millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Process memory sample from `/proc/self/status` (Linux).
+#[derive(Clone, Debug)]
+pub struct MemSample {
+    pub t_ms: u64,
+    pub rss_kb: u64,
+    pub vsz_kb: u64,
+}
+
+/// Sample VmRSS / VmSize for this process (listener + dialers share the PID).
+pub fn sample_mem(t0: Instant) -> Option<MemSample> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_kb = None;
+    let mut vsz_kb = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss_kb = parse_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("VmSize:") {
+            vsz_kb = parse_kb_field(rest);
+        }
+        if rss_kb.is_some() && vsz_kb.is_some() {
+            break;
+        }
+    }
+    Some(MemSample {
+        t_ms: millis(t0),
+        rss_kb: rss_kb?,
+        vsz_kb: vsz_kb?,
+    })
+}
+
+fn parse_kb_field(rest: &str) -> Option<u64> {
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// Push an RTT sample with optional stride and hard cap (avoids huge reports).
+pub fn push_rtt_sample(samples: &mut Vec<u64>, rtt_us: u64, received: u64, stride: u64) {
+    let stride = stride.max(1);
+    if received % stride != 0 {
+        return;
+    }
+    if samples.len() < MAX_RTT_SAMPLES {
+        samples.push(rtt_us);
+    }
+}
+
+#[derive(Default)]
+pub struct FrameBuf {
+    buf: Vec<u8>,
+    head: usize,
+}
+
+impl FrameBuf {
+    pub fn push(&mut self, data: &[u8]) {
+        if self.head != 0 {
+            self.buf.copy_within(self.head.., 0);
+            self.buf.truncate(self.buf.len() - self.head);
+            self.head = 0;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Returns a borrowed frame slice (no `.to_vec()`). Compact happens on next `push`.
+    pub fn pop(&mut self, frame_len: usize) -> Option<&[u8]> {
+        let end = self.head.checked_add(frame_len)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        let start = self.head;
+        self.head = end;
+        Some(&self.buf[start..end])
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DialResult {
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub dial_ms: u64,
+    pub identify_ms: u64,
+    pub echo_open_ms: u64,
+    pub wall_ms: u64,
+    pub sent: u64,
+    pub received: u64,
+    pub lost: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub builtin_ping_rtts_ms: Vec<u64>,
+    /// Echo RTTs in microseconds (prefer over ms for sub-ms work).
+    pub echo_rtts_us: Vec<u64>,
+    /// How many echo RTT samples were dropped due to stride/cap (informational).
+    pub echo_rtt_samples_stored: u64,
+}
+
+impl DialResult {
+    pub fn fail(name: &str, err: impl ToString) -> Self {
+        Self {
+            name: name.into(),
+            ok: false,
+            error: Some(err.to_string()),
+            dial_ms: 0,
+            identify_ms: 0,
+            echo_open_ms: 0,
+            wall_ms: 0,
+            sent: 0,
+            received: 0,
+            lost: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            builtin_ping_rtts_ms: Vec::new(),
+            echo_rtts_us: Vec::new(),
+            echo_rtt_samples_stored: 0,
+        }
+    }
+
+    pub fn blank(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok: true,
+            error: None,
+            dial_ms: 0,
+            identify_ms: 0,
+            echo_open_ms: 0,
+            wall_ms: 0,
+            sent: 0,
+            received: 0,
+            lost: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            builtin_ping_rtts_ms: Vec::new(),
+            echo_rtts_us: Vec::new(),
+            echo_rtt_samples_stored: 0,
+        }
+    }
+
+    pub fn avg_echo_rtt_us(&self) -> f64 {
+        avg(&self.echo_rtts_us)
+    }
+
+    /// Average echo RTT in milliseconds (derived from µs samples).
+    pub fn avg_echo_rtt(&self) -> f64 {
+        self.avg_echo_rtt_us() / 1000.0
+    }
+
+    pub fn percentile_echo_rtt_us(&self, p: f64) -> u64 {
+        percentile(&self.echo_rtts_us, p)
+    }
+
+    pub fn percentile_echo_rtt(&self, p: f64) -> f64 {
+        self.percentile_echo_rtt_us(p) as f64 / 1000.0
+    }
+
+    pub fn mbps(&self) -> f64 {
+        if self.wall_ms == 0 {
+            return 0.0;
+        }
+        (self.bytes_sent as f64 * 8.0) / (self.wall_ms as f64 / 1000.0) / 1_000_000.0
+    }
+}
+
+pub fn avg(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        0.0
+    } else {
+        samples.iter().sum::<u64>() as f64 / samples.len() as f64
+    }
+}
+
+pub fn percentile(samples: &[u64], p: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let idx = ((p.clamp(0.0, 1.0) * (v.len() as f64 - 1.0)).round() as usize).min(v.len() - 1);
+    v[idx]
+}
+
+pub struct DialOpts {
+    pub addr: PeerAddr,
+    pub count: u64,
+    pub interval: Duration,
+    pub payload: usize,
+    pub builtin_ping: u64,
+    pub quiet: bool,
+    pub name: String,
+    /// Stop sending after this wall duration (in addition to `count`).
+    pub max_echo_duration: Option<Duration>,
+    /// Store every Nth echo RTT (1 = all). Counts remain exact.
+    pub rtt_sample_stride: u64,
+    pub transport: TransportKind,
+}
+
+impl DialOpts {
+    pub fn basic(
+        name: impl Into<String>,
+        addr: PeerAddr,
+        count: u64,
+        interval: Duration,
+        payload: usize,
+        builtin_ping: u64,
+    ) -> Self {
+        Self {
+            addr,
+            count,
+            interval,
+            payload,
+            builtin_ping,
+            quiet: true,
+            name: name.into(),
+            max_echo_duration: None,
+            rtt_sample_stride: 1,
+            transport: TransportKind::Quic,
+        }
+    }
+}
+
+pub fn run_dial_collect(opts: DialOpts) -> DialResult {
+    let name = opts.name.clone();
+    match run_dial_collect_inner(opts) {
+        Ok(r) => r,
+        Err(e) => DialResult::fail(&name, e),
+    }
+}
+
+fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
+    let quiet = opts.quiet;
+    let stride = opts.rtt_sample_stride.max(1);
+    let mut endpoint = build_endpoint(None, opts.transport)?;
+    let _ = endpoint.listen_all()?;
+    let t0 = Instant::now();
+
+    let ids = endpoint.dial(&opts.addr)?;
+    let dial_ms = millis(t0);
+    if !quiet {
+        println!("[dial] dial-started ids={ids:?} elapsed_ms={dial_ms}");
+    }
+
+    let peer = opts.addr.peer_id().clone();
+    let _ready = endpoint
+        .wait_peer_ready(&peer, Duration::from_secs(20))?
+        .ok_or("identify timed out")?;
+    let identify_ms = millis(t0);
+
+    let mut builtin_ping_rtts_ms = Vec::new();
+    for _ in 0..opts.builtin_ping {
+        endpoint.ping(&peer)?;
+        let rtt = endpoint
+            .wait_ping_rtt(&peer, Duration::from_secs(5))?
+            .ok_or("builtin ping timed out")?;
+        builtin_ping_rtts_ms.push(rtt);
+    }
+
+    let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
+    let stream_ready_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let Some(event) = endpoint.next_event(stream_ready_deadline)? else {
+            return Err("echo stream never became ready".into());
+        };
+        match event {
+            Event::StreamReady {
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally: true,
+                ..
+            } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => break,
+            Event::Error(err) => return Err(format!("swarm error while opening stream: {err:?}").into()),
+            _ => {}
+        }
+    }
+    let echo_open_ms = millis(t0);
+
+    let mut frames = FrameBuf::default();
+    let mut outstanding: HashMap<u64, Instant> = HashMap::new();
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut bytes_sent = 0u64;
+    let mut bytes_recv = 0u64;
+    let mut echo_rtts_us = Vec::new();
+    let mut next_send = Instant::now();
+    let mut closing = false;
+    let echo_start = Instant::now();
+    let frame_len = FRAME_LEN + opts.payload;
+    // Cap in-flight echoes so we do not fill quiche stream queues (soak hazard).
+    let max_outstanding: usize = if opts.payload >= 16 * 1024 {
+        8
+    } else if opts.payload >= 1024 {
+        32
+    } else {
+        128
+    };
+
+    loop {
+        let blocked = outstanding.len() >= max_outstanding;
+        let wait_for = if closing {
+            Instant::now() + Duration::from_secs(5)
+        } else if blocked {
+            // Wait for replies instead of busy-sending into a full queue.
+            Instant::now() + Duration::from_millis(5)
+        } else {
+            next_send
+        };
+
+        match endpoint.next_event(wait_for)? {
+            None => {
+                if closing {
+                    break;
+                }
+                let duration_done = opts
+                    .max_echo_duration
+                    .is_some_and(|d| echo_start.elapsed() >= d);
+                if sent >= opts.count || duration_done {
+                    endpoint.close_stream_write(&peer, stream)?;
+                    closing = true;
+                    continue;
+                }
+                if outstanding.len() >= max_outstanding {
+                    continue;
+                }
+                sent += 1;
+                let seq = sent;
+                let mut frame = encode_header(seq, millis(t0));
+                if opts.payload > 0 {
+                    frame.extend(std::iter::repeat_n(0xAB, opts.payload));
+                }
+                let len = frame.len() as u64;
+                match endpoint.send_stream(&peer, stream, frame) {
+                    Ok(()) => {
+                        bytes_sent += len;
+                        outstanding.insert(seq, Instant::now());
+                        next_send = Instant::now() + opts.interval;
+                    }
+                    Err(err) => {
+                        // Back off and drain; common under burst before flow control catches up.
+                        // QUIC: "resource exhausted" / "queued"; TCP/Yamux: "send buffer is full".
+                        let msg = err.to_string();
+                        let backpressure = msg.contains("resource exhausted")
+                            || msg.contains("queued")
+                            || msg.contains("send buffer is full")
+                            || msg.contains("buffer is full");
+                        if backpressure {
+                            sent -= 1;
+                            next_send = Instant::now() + Duration::from_millis(2);
+                            continue;
+                        }
+                        return Err(format!("send_stream failed: {err}").into());
+                    }
+                }
+            }
+            Some(Event::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            }) if peer_id == peer && stream_id == stream => {
+                bytes_recv += data.len() as u64;
+                frames.push(&data);
+                while let Some(frame) = frames.pop(frame_len) {
+                    if frame.len() < FRAME_LEN {
+                        continue;
+                    }
+                    let (seq, _) = decode_header(&frame[..FRAME_LEN]);
+                    if let Some(sent_at) = outstanding.remove(&seq) {
+                        let rtt = sent_at.elapsed().as_micros() as u64;
+                        received += 1;
+                        push_rtt_sample(&mut echo_rtts_us, rtt, received, stride);
+                    }
+                }
+                if closing && outstanding.is_empty() {
+                    break;
+                }
+            }
+            Some(Event::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            })
+            | Some(Event::StreamClosed {
+                peer_id, stream_id, ..
+            }) if peer_id == peer && stream_id == stream => break,
+            Some(Event::Error(err)) => return Err(format!("swarm error: {err:?}").into()),
+            Some(_) => {}
+        }
+    }
+
+    let wall_ms = echo_start.elapsed().as_millis() as u64;
+    let stored = echo_rtts_us.len() as u64;
+    Ok(DialResult {
+        name: opts.name,
+        ok: sent > 0 && received == sent,
+        error: if received == sent {
+            None
+        } else {
+            Some(format!("lost {} frames", sent.saturating_sub(received)))
+        },
+        dial_ms,
+        identify_ms,
+        echo_open_ms,
+        wall_ms,
+        sent,
+        received,
+        lost: sent.saturating_sub(received),
+        bytes_sent,
+        bytes_recv,
+        builtin_ping_rtts_ms,
+        echo_rtts_us,
+        echo_rtt_samples_stored: stored,
+    })
+}
+
+/// One reconnect iteration: dial → identify → open → N echoes → drop Endpoint.
+pub fn run_reconnect_once(
+    addr: &PeerAddr,
+    echoes: u64,
+    payload: usize,
+    transport: TransportKind,
+) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
+    run_reconnect_once_ex(addr, echoes, payload, transport, None, false)
+}
+
+/// Like [`run_reconnect_once`], with optional reused identity and explicit `disconnect()`.
+pub fn run_reconnect_once_ex(
+    addr: &PeerAddr,
+    echoes: u64,
+    payload: usize,
+    transport: TransportKind,
+    identity: Option<Ed25519Keypair>,
+    disconnect: bool,
+) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
+    let mut endpoint = build_endpoint_identity(None, transport, identity)?;
+    let _ = endpoint.listen_all()?;
+    let peer = addr.peer_id().clone();
+    endpoint.dial(addr)?;
+    let _ = endpoint
+        .wait_peer_ready(&peer, Duration::from_secs(20))?
+        .ok_or("identify timed out")?;
+    let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let Some(event) = endpoint.next_event(deadline)? else {
+            return Err("echo stream never became ready".into());
+        };
+        match event {
+            Event::StreamReady {
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally: true,
+                ..
+            } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => break,
+            Event::Error(err) => return Err(format!("swarm error: {err:?}").into()),
+            _ => {}
+        }
+    }
+
+    let mut frames = FrameBuf::default();
+    let mut outstanding: HashMap<u64, Instant> = HashMap::new();
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut rtts = Vec::new();
+    let mut next_send = Instant::now();
+    let mut closing = false;
+    let frame_len = FRAME_LEN + payload;
+    let t0 = Instant::now();
+
+    loop {
+        let wait_for = if closing {
+            Instant::now() + Duration::from_secs(5)
+        } else {
+            next_send
+        };
+        match endpoint.next_event(wait_for)? {
+            None => {
+                if closing {
+                    break;
+                }
+                if sent >= echoes {
+                    endpoint.close_stream_write(&peer, stream)?;
+                    closing = true;
+                    continue;
+                }
+                sent += 1;
+                let mut frame = encode_header(sent, millis(t0));
+                if payload > 0 {
+                    frame.extend(std::iter::repeat_n(0xCD, payload));
+                }
+                endpoint.send_stream(&peer, stream, frame)?;
+                outstanding.insert(sent, Instant::now());
+                next_send = Instant::now();
+            }
+            Some(Event::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            }) if peer_id == peer && stream_id == stream => {
+                frames.push(&data);
+                while let Some(frame) = frames.pop(frame_len) {
+                    if frame.len() < FRAME_LEN {
+                        continue;
+                    }
+                    let (seq, _) = decode_header(&frame[..FRAME_LEN]);
+                    if let Some(sent_at) = outstanding.remove(&seq) {
+                        received += 1;
+                        push_rtt_sample(&mut rtts, sent_at.elapsed().as_micros() as u64, received, 1);
+                    }
+                }
+                if closing && outstanding.is_empty() {
+                    break;
+                }
+            }
+            Some(Event::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            })
+            | Some(Event::StreamClosed {
+                peer_id, stream_id, ..
+            }) if peer_id == peer && stream_id == stream => break,
+            Some(Event::Error(err)) => return Err(format!("swarm error: {err:?}").into()),
+            Some(_) => {}
+        }
+    }
+    if disconnect {
+        poll_after_disconnect(&mut endpoint, &peer)?;
+    }
+    // Endpoint dropped here — critical for reconnect churn leak detection.
+    Ok((sent, received, rtts))
+}
+
+/// Call `disconnect(peer)` then poll until `ConnectionClosed` or a short timeout.
+fn poll_after_disconnect(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    endpoint.disconnect(peer)?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match endpoint.next_event(deadline)? {
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == *peer => return Ok(()),
+            Some(Event::Error(_)) => {}
+            None => return Ok(()),
+            Some(_) => {
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Keep one dialer Endpoint/connection; open/echo/close `n_streams` sequential streams.
+pub fn run_stream_churn(
+    addr: &PeerAddr,
+    n_streams: u64,
+    echoes_per: u64,
+    payload: usize,
+    transport: TransportKind,
+) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
+    let mut endpoint = build_endpoint(None, transport)?;
+    let _ = endpoint.listen_all()?;
+    let peer = addr.peer_id().clone();
+    endpoint.dial(addr)?;
+    let _ = endpoint
+        .wait_peer_ready(&peer, Duration::from_secs(20))?
+        .ok_or("identify timed out")?;
+
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut rtts = Vec::new();
+    let frame_len = FRAME_LEN + payload;
+
+    for i in 0..n_streams {
+        let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
+        let ready_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let Some(event) = endpoint.next_event(ready_deadline)? else {
+                return Err(format!("stream {i} never became ready").into());
+            };
+            match event {
+                Event::StreamReady {
+                    peer_id,
+                    stream_id,
+                    protocol_id,
+                    initiated_locally: true,
+                    ..
+                } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => {
+                    break
+                }
+                Event::Error(err) => {
+                    return Err(format!("swarm error opening stream {i}: {err:?}").into());
+                }
+                _ => {}
+            }
+        }
+
+        let mut frames = FrameBuf::default();
+        let mut outstanding: HashMap<u64, Instant> = HashMap::new();
+        let mut stream_sent = 0u64;
+        let mut closing = false;
+        let t0 = Instant::now();
+
+        loop {
+            let wait_for = if closing {
+                Instant::now() + Duration::from_secs(2)
+            } else {
+                Instant::now()
+            };
+            match endpoint.next_event(wait_for)? {
+                None => {
+                    if closing {
+                        return Err(format!(
+                            "stream {i} close timed out (outstanding {})",
+                            outstanding.len()
+                        )
+                        .into());
+                    }
+                    if stream_sent >= echoes_per {
+                        endpoint.close_stream_write(&peer, stream)?;
+                        closing = true;
+                        continue;
+                    }
+                    stream_sent += 1;
+                    sent += 1;
+                    let mut frame = encode_header(stream_sent, millis(t0));
+                    if payload > 0 {
+                        frame.extend(std::iter::repeat_n(0xEF, payload));
+                    }
+                    match endpoint.send_stream(&peer, stream, frame) {
+                        Ok(()) => {
+                            outstanding.insert(stream_sent, Instant::now());
+                        }
+                        Err(err) => {
+                            sent -= 1;
+                            stream_sent -= 1;
+                            let msg = err.to_string();
+                            let backpressure = msg.contains("resource exhausted")
+                                || msg.contains("queued")
+                                || msg.contains("send buffer is full")
+                                || msg.contains("buffer is full");
+                            if backpressure {
+                                continue;
+                            }
+                            return Err(format!("send_stream stream {i}: {err}").into());
+                        }
+                    }
+                }
+                Some(Event::StreamData {
+                    peer_id,
+                    stream_id,
+                    data,
+                    ..
+                }) if peer_id == peer && stream_id == stream => {
+                    frames.push(&data);
+                    while let Some(frame) = frames.pop(frame_len) {
+                        if frame.len() < FRAME_LEN {
+                            continue;
+                        }
+                        let (seq, _) = decode_header(&frame[..FRAME_LEN]);
+                        if let Some(sent_at) = outstanding.remove(&seq) {
+                            received += 1;
+                            push_rtt_sample(
+                                &mut rtts,
+                                sent_at.elapsed().as_micros() as u64,
+                                received,
+                                1,
+                            );
+                        }
+                    }
+                }
+                Some(Event::StreamRemoteWriteClosed {
+                    peer_id, stream_id, ..
+                })
+                | Some(Event::StreamClosed {
+                    peer_id, stream_id, ..
+                }) if peer_id == peer && stream_id == stream => break,
+                Some(Event::Error(err)) => {
+                    return Err(format!("swarm error stream {i}: {err:?}").into());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok((sent, received, rtts))
+}
+
+pub fn run_listen_loop(
+    bind: &str,
+    transport: TransportKind,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    addr_tx: std::sync::mpsc::Sender<PeerAddr>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::atomic::Ordering;
+
+    let mut endpoint = build_endpoint(Some(bind), transport)?;
+    let addrs = endpoint.listen_all()?;
+    let first = addrs
+        .into_iter()
+        .next()
+        .ok_or("listen produced no addresses")?;
+    let _ = addr_tx.send(first);
+
+    // HashMap avoids (PeerId, StreamId) tuple clones on every StreamData lookup.
+    let mut streams: HashMap<PeerId, HashSet<StreamId>> = HashMap::new();
+    while !stop.load(Ordering::SeqCst) {
+        let Some(event) = endpoint.next_event(Duration::from_millis(100))? else {
+            continue;
+        };
+        match event {
+            Event::StreamReady {
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally: false,
+                ..
+            } if protocol_id == ECHO_PROTOCOL => {
+                streams.entry(peer_id).or_default().insert(stream_id);
+            }
+            Event::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            } => {
+                let active = streams
+                    .get(&peer_id)
+                    .is_some_and(|s| s.contains(&stream_id));
+                if !active {
+                    continue;
+                }
+                // Move owned Vec into send_stream — API requires Into<Vec<u8>>.
+                if let Err(err) = endpoint.send_stream(&peer_id, stream_id, data) {
+                    eprintln!("[listen] echo send failed: {err}");
+                    if let Some(set) = streams.get_mut(&peer_id) {
+                        set.remove(&stream_id);
+                    }
+                }
+            }
+            Event::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            } => {
+                if streams
+                    .get(&peer_id)
+                    .is_some_and(|s| s.contains(&stream_id))
+                {
+                    let _ = endpoint.close_stream_write(&peer_id, stream_id);
+                    if let Some(set) = streams.get_mut(&peer_id) {
+                        set.remove(&stream_id);
+                    }
+                }
+            }
+            Event::StreamClosed {
+                peer_id, stream_id, ..
+            } => {
+                if let Some(set) = streams.get_mut(&peer_id) {
+                    set.remove(&stream_id);
+                }
+            }
+            Event::Error(err) => eprintln!("[listen] swarm error: {err:?}"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
