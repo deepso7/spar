@@ -1,28 +1,24 @@
 //! spar — sync sparring harness for minip2p (no Tokio / no async).
 
 mod common;
-mod gossip;
-mod nat;
-mod relay_server;
 mod suite;
 
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 use minip2p::PeerAddr;
 
 use common::{run_dial_collect, run_listen_loop, DialOpts, TransportKind};
-use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc};
-use std::thread;
 use suite::SuiteArgs;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
-    // Optional global: spar --transport tcp <cmd> ...
     let mut global_transport = TransportKind::Quic;
     while args.first().map(|s| s.as_str()) == Some("--transport") {
         if args.len() < 2 {
@@ -53,14 +49,15 @@ fn main() -> ExitCode {
                 let stop = Arc::new(AtomicBool::new(false));
                 let (tx, rx) = mpsc::channel();
                 let stop2 = Arc::clone(&stop);
-                // Ctrl-C: just process kill for now; listen runs until killed.
                 let handle = thread::spawn(move || run_listen_loop(&bind, transport, stop2, tx));
                 if let Ok(addr) = rx.recv() {
                     println!("[listen] us={}", addr.peer_id());
                     println!("[listen] addr={addr}");
-                    eprintln!("[listen] transport={} echoing (Ctrl-C to stop)", transport.as_str());
+                    eprintln!(
+                        "[listen] transport={} echoing (Ctrl-C to stop)",
+                        transport.as_str()
+                    );
                 }
-                // Park forever until process killed.
                 let _ = handle.join();
                 Ok(())
             }
@@ -109,22 +106,6 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
-        "deep" => match parse_deep(rest, global_transport) {
-            Ok(suite_args) => suite::run_suite(suite_args),
-            Err(msg) => {
-                eprintln!("{msg}");
-                usage();
-                return ExitCode::from(2);
-            }
-        },
-        "stress" => match parse_stress(rest, global_transport) {
-            Ok(suite_args) => suite::run_suite(suite_args),
-            Err(msg) => {
-                eprintln!("{msg}");
-                usage();
-                return ExitCode::from(2);
-            }
-        },
         "help" | "-h" | "--help" => {
             usage();
             return ExitCode::SUCCESS;
@@ -151,28 +132,15 @@ fn usage() {
 spar — sync sparring harness for minip2p (no Tokio/async)
 
 Usage:
-  spar [--transport quic|tcp] listen [--bind HOST:PORT] [--transport quic|tcp]
-  spar [--transport quic|tcp] dial <peer-multiaddr> [options]
-  spar [--transport quic|tcp] suite [--out DIR] [--deep] [--stress] [--gossip] [--nat] [--transport quic|tcp]
-  spar [--transport quic|tcp] deep [--out DIR] [--gossip] [--nat] [--transport quic|tcp]
-  spar [--transport quic|tcp] stress [--out DIR] [--gossip] [--nat] [--transport quic|tcp]
+  spar [--transport quic|tcp] listen [--bind HOST:PORT]
+  spar [--transport quic|tcp] dial <peer-multiaddr> [--count N] [--interval MS] [--payload N] [--builtin-ping N]
+  spar [--transport quic|tcp] suite [--out DIR] [--deep]
 
-Global/command option:
   --transport quic|tcp   wire transport (default quic). Listener + dialers must match.
 
-Dial options:
-  --count N          echo rounds (default 5)
-  --interval MS      delay between rounds (default 200)
-  --payload N        extra payload bytes after 16-byte header (default 0)
-  --builtin-ping N   stack pings after identify (default 0)
-
+Dial: --count N (5)  --interval MS (200)  --payload extra bytes (0)  --builtin-ping N (0)
 Suite writes reports/run-<stamp>/report.md, report.json, memory.csv
-Deep mode adds long echoes, reconnect churn, soak, and memory sampling.
-Stress mode is deep plus soak-180s, stream-churn, same-peer reconnect, and disconnect churn.
---gossip runs loopback gossipsub scenarios (2-node, 4-node star, fanout-200, unsub).
---nat runs NAT/circuit scenarios (direct path, nopath, direct echo-20, circuit echo-10).
-Standalone --gossip/--nat skips echo scenarios; combine with --deep/--stress to run them after echo.
-TCP reports label stack as TCP / Noise / Yamux; QUIC as QUIC / quiche; gossip adds + gossipsub; nat adds + nat/circuit."
+Default is a short echo suite. --deep adds long echoes, reconnect-churn-200, 30s soak."
     );
 }
 
@@ -202,9 +170,6 @@ fn parse_suite(
 ) -> Result<SuiteArgs, String> {
     let mut out = PathBuf::from("reports");
     let mut deep = false;
-    let mut stress = false;
-    let mut gossip = false;
-    let mut nat = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => {
@@ -214,9 +179,6 @@ fn parse_suite(
                     .ok_or_else(|| "--out needs a value".to_string())?;
             }
             "--deep" => deep = true,
-            "--stress" => stress = true,
-            "--gossip" => gossip = true,
-            "--nat" => nat = true,
             "--transport" => {
                 let v = args.next().ok_or_else(|| "--transport needs quic|tcp".to_string())?;
                 transport = TransportKind::parse(&v)?;
@@ -226,78 +188,7 @@ fn parse_suite(
     }
     Ok(SuiteArgs {
         out_dir: out,
-        deep: deep || stress,
-        stress,
-        gossip,
-        nat,
-        transport,
-    })
-}
-
-fn parse_deep(
-    mut args: impl Iterator<Item = String>,
-    mut transport: TransportKind,
-) -> Result<SuiteArgs, String> {
-    let mut out = PathBuf::from("reports");
-    let mut gossip = false;
-    let mut nat = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--out" => {
-                out = args
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--out needs a value".to_string())?;
-            }
-            "--gossip" => gossip = true,
-            "--nat" => nat = true,
-            "--transport" => {
-                let v = args.next().ok_or_else(|| "--transport needs quic|tcp".to_string())?;
-                transport = TransportKind::parse(&v)?;
-            }
-            other => return Err(format!("unknown deep option: {other}")),
-        }
-    }
-    Ok(SuiteArgs {
-        out_dir: out,
-        deep: true,
-        stress: false,
-        gossip,
-        nat,
-        transport,
-    })
-}
-
-fn parse_stress(
-    mut args: impl Iterator<Item = String>,
-    mut transport: TransportKind,
-) -> Result<SuiteArgs, String> {
-    let mut out = PathBuf::from("reports");
-    let mut gossip = false;
-    let mut nat = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--out" => {
-                out = args
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--out needs a value".to_string())?;
-            }
-            "--gossip" => gossip = true,
-            "--nat" => nat = true,
-            "--transport" => {
-                let v = args.next().ok_or_else(|| "--transport needs quic|tcp".to_string())?;
-                transport = TransportKind::parse(&v)?;
-            }
-            other => return Err(format!("unknown stress option: {other}")),
-        }
-    }
-    Ok(SuiteArgs {
-        out_dir: out,
-        deep: true,
-        stress: true,
-        gossip,
-        nat,
+        deep,
         transport,
     })
 }

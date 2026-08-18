@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
-use minip2p::{Ed25519Keypair, Endpoint, Event, PeerAddr, PeerId, StreamId};
+use minip2p::{Endpoint, Event, PeerAddr, PeerId, StreamId};
 
 pub const AGENT: &str = "spar/0.1.0";
 /// Crate version of the sparred stack (minip2p-rs from crates.io).
@@ -29,32 +29,6 @@ impl TransportKind {
         }
     }
 
-    /// Report label for the security/mux stack.
-    pub fn stack_label(self) -> String {
-        match self {
-            Self::Quic => format!("{STACK} (QUIC / quiche)"),
-            Self::Tcp => format!("{STACK} (TCP / Noise / Yamux)"),
-        }
-    }
-
-    /// Stack label, with gossipsub when those scenarios ran.
-    #[allow(dead_code)]
-    pub fn stack_label_with_gossip(self, gossip: bool) -> String {
-        self.stack_label_with_features(gossip, false)
-    }
-
-    /// Stack label including optional gossipsub and nat/circuit extras.
-    pub fn stack_label_with_features(self, gossip: bool, nat: bool) -> String {
-        let mut base = self.stack_label();
-        if nat {
-            base.push_str(" + nat/circuit");
-        }
-        if gossip {
-            base.push_str(" + gossipsub");
-        }
-        base
-    }
-
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "quic" => Ok(Self::Quic),
@@ -68,22 +42,10 @@ pub fn build_endpoint(
     bind: Option<&str>,
     transport: TransportKind,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    build_endpoint_identity(bind, transport, None)
-}
-
-/// Bind a loopback Endpoint, optionally reusing a host key (same PeerId / supersede).
-pub fn build_endpoint_identity(
-    bind: Option<&str>,
-    transport: TransportKind,
-    identity: Option<Ed25519Keypair>,
-) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     let addr = bind.unwrap_or("127.0.0.1:0");
-    let mut builder = Endpoint::builder()
+    let builder = Endpoint::builder()
         .agent_version(AGENT)
         .protocol(ECHO_PROTOCOL);
-    if let Some(kp) = identity {
-        builder = builder.identity(kp);
-    }
     let endpoint = match transport {
         TransportKind::Quic => builder.bind_quic(addr)?,
         TransportKind::Tcp => builder.bind_tcp(addr)?,
@@ -153,6 +115,14 @@ pub fn push_rtt_sample(samples: &mut Vec<u64>, rtt_us: u64, received: u64, strid
     }
 }
 
+fn is_backpressure(err: &dyn std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("resource exhausted")
+        || msg.contains("queued")
+        || msg.contains("send buffer is full")
+        || msg.contains("buffer is full")
+}
+
 #[derive(Default)]
 pub struct FrameBuf {
     buf: Vec<u8>,
@@ -208,18 +178,7 @@ impl DialResult {
             name: name.into(),
             ok: false,
             error: Some(err.to_string()),
-            dial_ms: 0,
-            identify_ms: 0,
-            echo_open_ms: 0,
-            wall_ms: 0,
-            sent: 0,
-            received: 0,
-            lost: 0,
-            bytes_sent: 0,
-            bytes_recv: 0,
-            builtin_ping_rtts_ms: Vec::new(),
-            echo_rtts_us: Vec::new(),
-            echo_rtt_samples_stored: 0,
+            ..Self::blank(name)
         }
     }
 
@@ -254,10 +213,6 @@ impl DialResult {
 
     pub fn percentile_echo_rtt_us(&self, p: f64) -> u64 {
         percentile(&self.echo_rtts_us, p)
-    }
-
-    pub fn percentile_echo_rtt(&self, p: f64) -> f64 {
-        self.percentile_echo_rtt_us(p) as f64 / 1000.0
     }
 
     pub fn mbps(&self) -> f64 {
@@ -309,6 +264,7 @@ impl DialOpts {
         interval: Duration,
         payload: usize,
         builtin_ping: u64,
+        transport: TransportKind,
     ) -> Self {
         Self {
             addr,
@@ -320,7 +276,7 @@ impl DialOpts {
             name: name.into(),
             max_echo_duration: None,
             rtt_sample_stride: 1,
-            transport: TransportKind::Quic,
+            transport,
         }
     }
 }
@@ -333,7 +289,38 @@ pub fn run_dial_collect(opts: DialOpts) -> DialResult {
     }
 }
 
-fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
+fn wait_stream_ready(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    stream: StreamId,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(event) = endpoint.next_event(deadline)? else {
+            return Err("echo stream never became ready".into());
+        };
+        match event {
+            Event::StreamReady {
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally: true,
+                ..
+            } if peer_id == *peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => {
+                return Ok(());
+            }
+            Event::Error(err) => {
+                return Err(format!("swarm error while opening stream: {err:?}").into());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn run_dial_collect_inner(
+    opts: DialOpts,
+) -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
     let quiet = opts.quiet;
     let stride = opts.rtt_sample_stride.max(1);
     let mut endpoint = build_endpoint(None, opts.transport)?;
@@ -362,23 +349,7 @@ fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::err
     }
 
     let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
-    let stream_ready_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let Some(event) = endpoint.next_event(stream_ready_deadline)? else {
-            return Err("echo stream never became ready".into());
-        };
-        match event {
-            Event::StreamReady {
-                peer_id,
-                stream_id,
-                protocol_id,
-                initiated_locally: true,
-                ..
-            } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => break,
-            Event::Error(err) => return Err(format!("swarm error while opening stream: {err:?}").into()),
-            _ => {}
-        }
-    }
+    wait_stream_ready(&mut endpoint, &peer, stream, Duration::from_secs(15))?;
     let echo_open_ms = millis(t0);
 
     let mut frames = FrameBuf::default();
@@ -406,7 +377,6 @@ fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::err
         let wait_for = if closing {
             Instant::now() + Duration::from_secs(5)
         } else if blocked {
-            // Wait for replies instead of busy-sending into a full queue.
             Instant::now() + Duration::from_millis(5)
         } else {
             next_send
@@ -444,12 +414,7 @@ fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::err
                     Err(err) => {
                         // Back off and drain; common under burst before flow control catches up.
                         // QUIC: "resource exhausted" / "queued"; TCP/Yamux: "send buffer is full".
-                        let msg = err.to_string();
-                        let backpressure = msg.contains("resource exhausted")
-                            || msg.contains("queued")
-                            || msg.contains("send buffer is full")
-                            || msg.contains("buffer is full");
-                        if backpressure {
+                        if is_backpressure(&err) {
                             sent -= 1;
                             next_send = Instant::now() + Duration::from_millis(2);
                             continue;
@@ -518,25 +483,14 @@ fn run_dial_collect_inner(opts: DialOpts) -> Result<DialResult, Box<dyn std::err
 }
 
 /// One reconnect iteration: dial → identify → open → N echoes → drop Endpoint.
+/// Fresh identity (unique PeerId) each call — this found the 0.4.1 leak.
 pub fn run_reconnect_once(
     addr: &PeerAddr,
     echoes: u64,
     payload: usize,
     transport: TransportKind,
 ) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
-    run_reconnect_once_ex(addr, echoes, payload, transport, None, false)
-}
-
-/// Like [`run_reconnect_once`], with optional reused identity and explicit `disconnect()`.
-pub fn run_reconnect_once_ex(
-    addr: &PeerAddr,
-    echoes: u64,
-    payload: usize,
-    transport: TransportKind,
-    identity: Option<Ed25519Keypair>,
-    disconnect: bool,
-) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
-    let mut endpoint = build_endpoint_identity(None, transport, identity)?;
+    let mut endpoint = build_endpoint(None, transport)?;
     let _ = endpoint.listen_all()?;
     let peer = addr.peer_id().clone();
     endpoint.dial(addr)?;
@@ -544,23 +498,7 @@ pub fn run_reconnect_once_ex(
         .wait_peer_ready(&peer, Duration::from_secs(20))?
         .ok_or("identify timed out")?;
     let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let Some(event) = endpoint.next_event(deadline)? else {
-            return Err("echo stream never became ready".into());
-        };
-        match event {
-            Event::StreamReady {
-                peer_id,
-                stream_id,
-                protocol_id,
-                initiated_locally: true,
-                ..
-            } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => break,
-            Event::Error(err) => return Err(format!("swarm error: {err:?}").into()),
-            _ => {}
-        }
-    }
+    wait_stream_ready(&mut endpoint, &peer, stream, Duration::from_secs(15))?;
 
     let mut frames = FrameBuf::default();
     let mut outstanding: HashMap<u64, Instant> = HashMap::new();
@@ -593,9 +531,20 @@ pub fn run_reconnect_once_ex(
                 if payload > 0 {
                     frame.extend(std::iter::repeat_n(0xCD, payload));
                 }
-                endpoint.send_stream(&peer, stream, frame)?;
-                outstanding.insert(sent, Instant::now());
-                next_send = Instant::now();
+                match endpoint.send_stream(&peer, stream, frame) {
+                    Ok(()) => {
+                        outstanding.insert(sent, Instant::now());
+                        next_send = Instant::now();
+                    }
+                    Err(err) => {
+                        if is_backpressure(&err) {
+                            sent -= 1;
+                            next_send = Instant::now() + Duration::from_millis(2);
+                            continue;
+                        }
+                        return Err(format!("send_stream failed: {err}").into());
+                    }
+                }
             }
             Some(Event::StreamData {
                 peer_id,
@@ -611,7 +560,12 @@ pub fn run_reconnect_once_ex(
                     let (seq, _) = decode_header(&frame[..FRAME_LEN]);
                     if let Some(sent_at) = outstanding.remove(&seq) {
                         received += 1;
-                        push_rtt_sample(&mut rtts, sent_at.elapsed().as_micros() as u64, received, 1);
+                        push_rtt_sample(
+                            &mut rtts,
+                            sent_at.elapsed().as_micros() as u64,
+                            received,
+                            1,
+                        );
                     }
                 }
                 if closing && outstanding.is_empty() {
@@ -628,166 +582,7 @@ pub fn run_reconnect_once_ex(
             Some(_) => {}
         }
     }
-    if disconnect {
-        poll_after_disconnect(&mut endpoint, &peer)?;
-    }
     // Endpoint dropped here — critical for reconnect churn leak detection.
-    Ok((sent, received, rtts))
-}
-
-/// Call `disconnect(peer)` then poll until `ConnectionClosed` or a short timeout.
-fn poll_after_disconnect(
-    endpoint: &mut Endpoint,
-    peer: &PeerId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    endpoint.disconnect(peer)?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match endpoint.next_event(deadline)? {
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == *peer => return Ok(()),
-            Some(Event::Error(_)) => {}
-            None => return Ok(()),
-            Some(_) => {
-                if Instant::now() >= deadline {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-/// Keep one dialer Endpoint/connection; open/echo/close `n_streams` sequential streams.
-pub fn run_stream_churn(
-    addr: &PeerAddr,
-    n_streams: u64,
-    echoes_per: u64,
-    payload: usize,
-    transport: TransportKind,
-) -> Result<(u64, u64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
-    let mut endpoint = build_endpoint(None, transport)?;
-    let _ = endpoint.listen_all()?;
-    let peer = addr.peer_id().clone();
-    endpoint.dial(addr)?;
-    let _ = endpoint
-        .wait_peer_ready(&peer, Duration::from_secs(20))?
-        .ok_or("identify timed out")?;
-
-    let mut sent = 0u64;
-    let mut received = 0u64;
-    let mut rtts = Vec::new();
-    let frame_len = FRAME_LEN + payload;
-
-    for i in 0..n_streams {
-        let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
-        let ready_deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let Some(event) = endpoint.next_event(ready_deadline)? else {
-                return Err(format!("stream {i} never became ready").into());
-            };
-            match event {
-                Event::StreamReady {
-                    peer_id,
-                    stream_id,
-                    protocol_id,
-                    initiated_locally: true,
-                    ..
-                } if peer_id == peer && stream_id == stream && protocol_id == ECHO_PROTOCOL => {
-                    break
-                }
-                Event::Error(err) => {
-                    return Err(format!("swarm error opening stream {i}: {err:?}").into());
-                }
-                _ => {}
-            }
-        }
-
-        let mut frames = FrameBuf::default();
-        let mut outstanding: HashMap<u64, Instant> = HashMap::new();
-        let mut stream_sent = 0u64;
-        let mut closing = false;
-        let t0 = Instant::now();
-
-        loop {
-            let wait_for = if closing {
-                Instant::now() + Duration::from_secs(2)
-            } else {
-                Instant::now()
-            };
-            match endpoint.next_event(wait_for)? {
-                None => {
-                    if closing {
-                        return Err(format!(
-                            "stream {i} close timed out (outstanding {})",
-                            outstanding.len()
-                        )
-                        .into());
-                    }
-                    if stream_sent >= echoes_per {
-                        endpoint.close_stream_write(&peer, stream)?;
-                        closing = true;
-                        continue;
-                    }
-                    stream_sent += 1;
-                    sent += 1;
-                    let mut frame = encode_header(stream_sent, millis(t0));
-                    if payload > 0 {
-                        frame.extend(std::iter::repeat_n(0xEF, payload));
-                    }
-                    match endpoint.send_stream(&peer, stream, frame) {
-                        Ok(()) => {
-                            outstanding.insert(stream_sent, Instant::now());
-                        }
-                        Err(err) => {
-                            sent -= 1;
-                            stream_sent -= 1;
-                            let msg = err.to_string();
-                            let backpressure = msg.contains("resource exhausted")
-                                || msg.contains("queued")
-                                || msg.contains("send buffer is full")
-                                || msg.contains("buffer is full");
-                            if backpressure {
-                                continue;
-                            }
-                            return Err(format!("send_stream stream {i}: {err}").into());
-                        }
-                    }
-                }
-                Some(Event::StreamData {
-                    peer_id,
-                    stream_id,
-                    data,
-                    ..
-                }) if peer_id == peer && stream_id == stream => {
-                    frames.push(&data);
-                    while let Some(frame) = frames.pop(frame_len) {
-                        if frame.len() < FRAME_LEN {
-                            continue;
-                        }
-                        let (seq, _) = decode_header(&frame[..FRAME_LEN]);
-                        if let Some(sent_at) = outstanding.remove(&seq) {
-                            received += 1;
-                            push_rtt_sample(
-                                &mut rtts,
-                                sent_at.elapsed().as_micros() as u64,
-                                received,
-                                1,
-                            );
-                        }
-                    }
-                }
-                Some(Event::StreamRemoteWriteClosed {
-                    peer_id, stream_id, ..
-                })
-                | Some(Event::StreamClosed {
-                    peer_id, stream_id, ..
-                }) if peer_id == peer && stream_id == stream => break,
-                Some(Event::Error(err)) => {
-                    return Err(format!("swarm error stream {i}: {err:?}").into());
-                }
-                Some(_) => {}
-            }
-        }
-    }
     Ok((sent, received, rtts))
 }
 

@@ -10,5 +10,4 @@ name = "spar"
 path = "src/main.rs"
 
 [dependencies]
-minip2p-rs = { version = "0.4.1", default-features = false, features = ["std", "quic", "tcp", "pubsub", "nat"] }
-minip2p-relay = "0.4.1"
+minip2p-rs = { version = "0.4.1", default-features = false, features = ["std", "quic", "tcp"] }
