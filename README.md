@@ -1,6 +1,6 @@
 # spar
 
-Sync sparring harness for [minip2p-rs](https://github.com/deepso7/minip2p) 0.4.1. No Tokio/async.
+Sync sparring harness for [minip2p-rs](https://github.com/deepso7/minip2p) 0.4.6. No Tokio/async.
 
 ```bash
 cargo build --release

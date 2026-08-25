@@ -8,7 +8,7 @@ use minip2p::{Endpoint, Event, PeerAddr, PeerId, StreamId};
 
 pub const AGENT: &str = "spar/0.1.0";
 /// Crate version of the sparred stack (minip2p-rs from crates.io).
-pub const STACK: &str = "minip2p-rs 0.4.1";
+pub const STACK: &str = "minip2p-rs 0.4.6";
 pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
 pub const FRAME_LEN: usize = 16;
 pub const MAX_RTT_SAMPLES: usize = 50_000;
