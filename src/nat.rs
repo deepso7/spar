@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectId, Ed25519Keypair, Endpoint, Event, NatConfig, NatError, NatEvent, Path, PeerId,
-    ReservationPolicy, StreamId,
+    ConnectId, Ed25519Keypair, Endpoint, Event, NatConfig, NatError, NatEvent, Path, PeerAddr,
+    PeerId, ReservationPolicy, StreamId,
 };
 
 use crate::common::{
@@ -37,9 +37,17 @@ fn bind(
     builder: minip2p::EndpointBuilder,
     transport: TransportKind,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    bind_on(builder, transport, "127.0.0.1:0")
+}
+
+fn bind_on(
+    builder: minip2p::EndpointBuilder,
+    transport: TransportKind,
+    listen: &str,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     Ok(match transport {
-        TransportKind::Quic => builder.bind_quic("127.0.0.1:0")?,
-        TransportKind::Tcp => builder.bind_tcp("127.0.0.1:0")?,
+        TransportKind::Quic => builder.bind_quic(listen)?,
+        TransportKind::Tcp => builder.bind_tcp(listen)?,
     })
 }
 
@@ -405,11 +413,16 @@ fn run_nopath(
     r
 }
 
-fn wait_reserved(ep: &mut Endpoint, relay_peer: &PeerId, relay: &RelayServer) -> Result<(), String> {
-    let until = Instant::now() + RESERVE_DEADLINE;
+fn wait_reserved(
+    ep: &mut Endpoint,
+    relay_peer: &PeerId,
+    hop: Option<&RelayServer>,
+    deadline: Duration,
+) -> Result<(), String> {
+    let until = Instant::now() + deadline;
     loop {
         if Instant::now() >= until {
-            return Err("responder did not reserve on loopback hop".into());
+            return Err(format!("responder did not reserve within {deadline:?}"));
         }
         let _ = ep.next_event(SLICE).map_err(|e| format!("next_event: {e}"))?;
         if ep
@@ -419,7 +432,9 @@ fn wait_reserved(ep: &mut Endpoint, relay_peer: &PeerId, relay: &RelayServer) ->
         {
             return Ok(());
         }
-        relay.check()?;
+        if let Some(relay) = hop {
+            relay.check()?;
+        }
     }
 }
 
@@ -427,34 +442,69 @@ fn run_circuit(
     transport: TransportKind,
     mem_log: &Arc<Mutex<Vec<(MemSample, String)>>>,
     suite_t0: Instant,
+    public_relay: Option<PeerAddr>,
 ) -> DialResult {
-    let name = "nat-circuit-echo-10";
+    let name = if public_relay.is_some() {
+        "nat-public-circuit-echo-10"
+    } else {
+        "nat-circuit-echo-10"
+    };
     eprintln!("[suite] running {name} …");
     record_mem(mem_log, suite_t0, &format!("before-{name}"));
     let t_scen = Instant::now();
+    let reserve_deadline = if public_relay.is_some() {
+        Duration::from_secs(20)
+    } else {
+        RESERVE_DEADLINE
+    };
+    let path_deadline = if public_relay.is_some() {
+        Duration::from_secs(20)
+    } else {
+        PATH_DEADLINE
+    };
     let result = (|| -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
-        let relay = RelayServer::spawn(transport).map_err(|e| format!("relay spawn: {e}"))?;
-        let relay_addr = relay.addr().clone();
+        let local = if public_relay.is_none() {
+            Some(RelayServer::spawn(transport).map_err(|e| format!("relay spawn: {e}"))?)
+        } else {
+            None
+        };
+        let relay_addr = match &public_relay {
+            Some(addr) => addr.clone(),
+            None => local.as_ref().expect("local hop").addr().clone(),
+        };
         let relay_peer = relay_addr.peer_id().clone();
+        eprintln!("[suite] {name} hop={relay_addr}");
 
-        let mut responder = bind(
+        let listen = if public_relay.is_some() {
+            "0.0.0.0:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let mut responder = bind_on(
             Endpoint::builder()
                 .agent_version(AGENT)
                 .protocol(ECHO_PROTOCOL)
                 .relay(relay_addr.clone())
                 .nat_config(nat_cfg(ReservationPolicy::Always, None, true)),
             transport,
+            listen,
         )?;
         responder.listen()?;
-        wait_reserved(&mut responder, &relay_peer, &relay)?;
+        wait_reserved(
+            &mut responder,
+            &relay_peer,
+            local.as_ref(),
+            reserve_deadline,
+        )?;
 
-        let mut initiator = bind(
+        let mut initiator = bind_on(
             Endpoint::builder()
                 .agent_version(AGENT)
                 .protocol(ECHO_PROTOCOL)
                 .relay(relay_addr)
                 .nat_config(nat_cfg(ReservationPolicy::Never, None, true)),
             transport,
+            listen,
         )?;
         initiator.listen()?;
         let responder_peer = responder.peer_id().clone();
@@ -463,22 +513,31 @@ fn run_circuit(
             .map_err(|e| format!("connect(peer): {e}"))?;
 
         let mut eps = [initiator, responder];
-        let (path, path_ms) = wait_path_established(&mut eps, 0, id, PATH_DEADLINE)
-            .map_err(|e| format!("{e}; relay={}", relay.check().err().unwrap_or_default()))?;
-        relay.check().map_err(|e| e.to_string())?;
+        let (path, path_ms) = wait_path_established(&mut eps, 0, id, path_deadline).map_err(|e| {
+            let hop = local
+                .as_ref()
+                .and_then(|r| r.check().err())
+                .unwrap_or_default();
+            format!("{e}; relay={hop}")
+        })?;
+        if let Some(relay) = &local {
+            relay.check().map_err(|e| e.to_string())?;
+        }
         if !matches!(path, Path::Relayed { .. }) {
             return Err(format!("expected Relayed, got {}", path_kind(&path)).into());
         }
         let kind = path_kind(&path);
         let (sent, received, bytes_sent, bytes_recv, rtts) =
             echo_n(&mut eps, 0, 1, 10).map_err(|e| format!("echo over {kind}: {e}"))?;
-        relay.check().map_err(|e| e.to_string())?;
+        if let Some(relay) = &local {
+            relay.check().map_err(|e| e.to_string())?;
+        }
         let final_path = eps[0]
             .path(&responder_peer)
             .map(|p| path_kind(&p))
             .unwrap_or_else(|| "none".into());
         drop(eps);
-        drop(relay);
+        drop(local);
         Ok(finish_ok(
             name,
             t_scen.elapsed().as_millis() as u64,
@@ -488,7 +547,7 @@ fn run_circuit(
             bytes_sent,
             bytes_recv,
             rtts,
-            format!("first_path={kind} final_path={final_path}"),
+            format!("first_path={kind} final_path={final_path} hop={relay_peer}"),
         ))
     })();
     record_mem(mem_log, suite_t0, &format!("after-{name}"));
@@ -508,11 +567,15 @@ pub fn run_nat_scenarios(
     transport: TransportKind,
     mem_log: &Arc<Mutex<Vec<(MemSample, String)>>>,
     suite_t0: Instant,
+    public_relay: Option<PeerAddr>,
 ) -> Vec<DialResult> {
+    if public_relay.is_some() {
+        return vec![run_circuit(transport, mem_log, suite_t0, public_relay)];
+    }
     vec![
         run_direct("nat-direct-path", 0, transport, mem_log, suite_t0),
         run_nopath(transport, mem_log, suite_t0),
         run_direct("nat-direct-echo-20", 20, transport, mem_log, suite_t0),
-        run_circuit(transport, mem_log, suite_t0),
+        run_circuit(transport, mem_log, suite_t0, None),
     ]
 }

@@ -13,8 +13,9 @@ cargo build --release
 ./target/release/spar suite --nat --out reports
 ./target/release/spar suite --gossip --transport tcp --out reports
 ./target/release/spar suite --deep --gossip --nat --out reports
+./target/release/spar suite --relay '/dns4/relay.minip2p.com/udp/19876/quic-v1/p2p/<relay-id>' --out reports
 ```
 
 `--transport` must match on listen and dial (default `quic`). Suite writes `reports/run-*/report.md`, `report.json`, and `memory.csv`.
 
-Default `suite` is a short echo pack. `--deep` adds long echoes, reconnect-churn-200, and a 30s soak. `--gossip` and `--nat` add loopback gossipsub and NAT/circuit packs. Used alone (without `--deep`) they skip the echo pack.
+Default `suite` is a short echo pack. `--deep` adds long echoes, reconnect-churn-200, and a 30s soak. `--gossip` and `--nat` add loopback gossipsub and NAT/circuit packs. `--relay <peer-addr>` smokes a public Circuit Relay v2 hop (`force_relay`, 10 echoes). Used alone (without `--deep`) they skip the echo pack.

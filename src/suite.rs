@@ -20,6 +20,7 @@ pub struct SuiteArgs {
     pub gossip: bool,
     pub nat: bool,
     pub transport: TransportKind,
+    pub relay: Option<PeerAddr>,
 }
 
 pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -32,7 +33,7 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
     fs::create_dir_all(&run_dir)?;
 
     let transport = args.transport;
-    let skip_echo = (args.gossip || args.nat) && !args.deep;
+    let skip_echo = (args.gossip || args.nat || args.relay.is_some()) && !args.deep;
     let stop = Arc::new(AtomicBool::new(false));
     let mut listener = None;
     let mut listen_addr: Option<PeerAddr> = None;
@@ -225,12 +226,13 @@ pub fn run_suite(args: SuiteArgs) -> Result<(), Box<dyn std::error::Error + Send
             suite_t0,
         ));
     }
-    if args.nat {
+    if args.nat || args.relay.is_some() {
         eprintln!("[suite] running NAT/circuit scenarios …");
         results.extend(crate::nat::run_nat_scenarios(
             transport,
             &mem_log,
             suite_t0,
+            args.relay.clone(),
         ));
     }
 
