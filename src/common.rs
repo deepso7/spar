@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, Event, PeerAddr, PeerId, StreamId};
@@ -681,4 +682,386 @@ pub fn run_listen_loop(
         }
     }
     Ok(())
+}
+
+// --- WAN listen/dial via a public Circuit Relay v2 hop (punch enabled) ---
+
+use minip2p::{Multiaddr, NatConfig, NatEvent, Path, Protocol, ReservationPolicy};
+
+fn path_name(path: &Path) -> String {
+    match path {
+        Path::DirectDialed => "DirectDialed".into(),
+        Path::DirectPunched => "DirectPunched".into(),
+        Path::Relayed { relay } => format!("Relayed({relay})"),
+    }
+}
+
+pub fn circuit_addr(relay: &PeerAddr, us: &PeerId) -> String {
+    format!("{}/p2p-circuit/p2p/{us}", relay.to_multiaddr())
+}
+
+pub enum DialTarget {
+    Direct(PeerAddr),
+    Circuit { relay: PeerAddr, peer: PeerId },
+}
+
+pub fn parse_dial_target(raw: &str) -> Result<DialTarget, String> {
+    let addr = Multiaddr::from_str(raw).map_err(|e| format!("invalid target '{raw}': {e}"))?;
+    if !addr
+        .protocols()
+        .iter()
+        .any(|p| matches!(p, Protocol::P2pCircuit))
+    {
+        let target =
+            PeerAddr::from_str(raw).map_err(|e| format!("invalid target peer-addr '{raw}': {e}"))?;
+        return Ok(DialTarget::Direct(target));
+    }
+    match addr.protocols() {
+        [prefix @ .., Protocol::P2p(relay_id), Protocol::P2pCircuit, Protocol::P2p(peer)]
+            if !prefix.is_empty() =>
+        {
+            let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), relay_id.clone())
+                .map_err(|e| format!("invalid relay in '{raw}': {e}"))?;
+            Ok(DialTarget::Circuit {
+                relay,
+                peer: peer.clone(),
+            })
+        }
+        _ => Err(format!(
+            "circuit target must end /p2p/<relay>/p2p-circuit/p2p/<peer>, got '{raw}'"
+        )),
+    }
+}
+
+fn build_nat_endpoint(
+    bind: &str,
+    transport: TransportKind,
+    relays: &[PeerAddr],
+    policy: ReservationPolicy,
+    force_relay: bool,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let mut cfg = NatConfig {
+        reservation_policy: policy,
+        force_relay,
+        ..NatConfig::default()
+    };
+    cfg.relays.extend(relays.iter().cloned());
+    let mut builder = Endpoint::builder()
+        .agent_version(AGENT)
+        .protocol(ECHO_PROTOCOL)
+        .nat_config(cfg);
+    for r in relays {
+        builder = builder.relay(r.clone());
+    }
+    Ok(match transport {
+        TransportKind::Quic => builder.bind_quic(bind)?,
+        TransportKind::Tcp => builder.bind_tcp(bind)?,
+    })
+}
+
+fn print_nat(tag: &str, event: &NatEvent) {
+    match event {
+        NatEvent::RelayReserved {
+            relay,
+            expires_unix_secs,
+            ..
+        } => eprintln!("[{tag}] nat-relay-reserved relay={relay} expires-unix={expires_unix_secs:?}"),
+        NatEvent::RelayReservationLost { relay } => {
+            eprintln!("[{tag}] nat-reservation-lost relay={relay}")
+        }
+        NatEvent::PathEstablished { peer, path, .. } => {
+            eprintln!("[{tag}] nat-path-established peer={peer} path={}", path_name(path))
+        }
+        NatEvent::PathUpgraded { peer, from, to, .. } => eprintln!(
+            "[{tag}] nat-path-upgraded peer={peer} from={} to={}",
+            path_name(from),
+            path_name(to)
+        ),
+        NatEvent::FellBackToRelay { peer, .. } => {
+            eprintln!("[{tag}] nat-fell-back-to-relay peer={peer}")
+        }
+        NatEvent::ConnectFailed { peer, error, .. } => {
+            eprintln!("[{tag}] nat-connect-failed peer={peer} error={error:?}")
+        }
+        NatEvent::HolePunchFailed { attempt, reason, .. } => {
+            eprintln!("[{tag}] nat-hole-punch-failed attempt={attempt} reason={reason}")
+        }
+        NatEvent::InboundDirectUpgrade { peer } => {
+            eprintln!("[{tag}] nat-inbound-direct-upgrade peer={peer}")
+        }
+        other => eprintln!("[{tag}] nat {other:?}"),
+    }
+}
+
+/// Listener that reserves on `relay` (Always, punch enabled) and echoes.
+pub fn run_listen_relay(
+    bind: &str,
+    transport: TransportKind,
+    relay: PeerAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    addr_tx: std::sync::mpsc::Sender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::atomic::Ordering;
+    let bind = if bind == "127.0.0.1:0" {
+        "0.0.0.0:0"
+    } else {
+        bind
+    };
+    let mut endpoint = build_nat_endpoint(
+        bind,
+        transport,
+        std::slice::from_ref(&relay),
+        ReservationPolicy::Always,
+        false,
+    )?;
+    let addrs = endpoint.listen_all()?;
+    let us = endpoint.peer_id().clone();
+    let _ = addr_tx.send(format!("us={us}"));
+    for a in &addrs {
+        let _ = addr_tx.send(format!("addr={a}"));
+    }
+
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut reserved = false;
+    while Instant::now() < until {
+        match endpoint.next_nat_event(until)? {
+            Some(NatEvent::RelayReserved { .. }) => {
+                let circuit = circuit_addr(&relay, &us);
+                let _ = addr_tx.send(format!("circuit={circuit}"));
+                reserved = true;
+                break;
+            }
+            Some(ev) => print_nat("listen", &ev),
+            None => break,
+        }
+    }
+    if !reserved {
+        let _ = addr_tx.send("warn=no reservation within 20s; still listening".into());
+    }
+
+    let mut streams: HashMap<PeerId, HashSet<StreamId>> = HashMap::new();
+    while !stop.load(Ordering::SeqCst) {
+        for ev in endpoint.take_nat_events() {
+            print_nat("listen", &ev);
+        }
+        let Some(event) = endpoint.next_event(Duration::from_millis(100))? else {
+            continue;
+        };
+        match event {
+            Event::StreamReady {
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally: false,
+                ..
+            } if protocol_id == ECHO_PROTOCOL => {
+                streams.entry(peer_id).or_default().insert(stream_id);
+            }
+            Event::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            } => {
+                let active = streams
+                    .get(&peer_id)
+                    .is_some_and(|s| s.contains(&stream_id));
+                if !active {
+                    continue;
+                }
+                if let Err(err) = endpoint.send_stream(&peer_id, stream_id, data) {
+                    eprintln!("[listen] echo send failed: {err}");
+                    if let Some(set) = streams.get_mut(&peer_id) {
+                        set.remove(&stream_id);
+                    }
+                }
+            }
+            Event::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            } => {
+                if streams
+                    .get(&peer_id)
+                    .is_some_and(|s| s.contains(&stream_id))
+                {
+                    let _ = endpoint.close_stream_write(&peer_id, stream_id);
+                    if let Some(set) = streams.get_mut(&peer_id) {
+                        set.remove(&stream_id);
+                    }
+                }
+            }
+            Event::StreamClosed {
+                peer_id, stream_id, ..
+            } => {
+                if let Some(set) = streams.get_mut(&peer_id) {
+                    set.remove(&stream_id);
+                }
+            }
+            Event::Error(err) => eprintln!("[listen] swarm error: {err:?}"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Dial a direct or circuit target with the NAT agent (punch enabled).
+pub fn run_dial_nat(
+    target: DialTarget,
+    extra_relay: Option<PeerAddr>,
+    count: u64,
+    interval: Duration,
+    payload: usize,
+    transport: TransportKind,
+) -> DialResult {
+    let name = "cli-dial-nat";
+    match run_dial_nat_inner(target, extra_relay, count, interval, payload, transport) {
+        Ok(r) => r,
+        Err(e) => DialResult::fail(name, e),
+    }
+}
+
+fn run_dial_nat_inner(
+    target: DialTarget,
+    extra_relay: Option<PeerAddr>,
+    count: u64,
+    interval: Duration,
+    payload: usize,
+    transport: TransportKind,
+) -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
+    let mut relays = Vec::new();
+    if let DialTarget::Circuit { relay, .. } = &target {
+        relays.push(relay.clone());
+    }
+    if let Some(extra) = extra_relay
+        && !relays.iter().any(|r| r.peer_id() == extra.peer_id())
+    {
+        relays.push(extra);
+    }
+    if relays.is_empty() {
+        return Err("dial --relay / circuit target required for NAT dial".into());
+    }
+
+    let mut endpoint = build_nat_endpoint(
+        "0.0.0.0:0",
+        transport,
+        &relays,
+        ReservationPolicy::Never,
+        false,
+    )?;
+    let _ = endpoint.listen_all()?;
+    eprintln!("[dial] us={}", endpoint.peer_id());
+
+    let t0 = Instant::now();
+    let (peer, connect_id) = match &target {
+        DialTarget::Circuit { peer, relay } => {
+            eprintln!("[dial] target={peer} via-relay={}", relay.peer_id());
+            let id = endpoint.connect(peer)?;
+            (peer.clone(), id)
+        }
+        DialTarget::Direct(addr) => {
+            eprintln!("[dial] target={addr}");
+            let id = endpoint.connect_addr(addr)?;
+            (addr.peer_id().clone(), id)
+        }
+    };
+
+    let path = endpoint.wait_path(connect_id, Duration::from_secs(25))?;
+    let Some(path) = path else {
+        for ev in endpoint.take_nat_events() {
+            print_nat("dial", &ev);
+        }
+        return Err("no path to the target".into());
+    };
+    let first = path_name(&path);
+    eprintln!(
+        "[dial] path-established path={first} elapsed={}ms",
+        t0.elapsed().as_millis()
+    );
+
+    let _ = endpoint.wait_peer_ready(&peer, Duration::from_secs(15))?;
+    let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
+    wait_stream_ready(&mut endpoint, &peer, stream, Duration::from_secs(15))?;
+
+    let mut frames = FrameBuf::default();
+    let mut outstanding: HashMap<u64, Instant> = HashMap::new();
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut rtts = Vec::new();
+    let mut next_send = Instant::now();
+    let mut last_path = first.clone();
+    let mut upgraded: Option<String> = None;
+    let frame_len = FRAME_LEN + payload;
+    let echo_t0 = Instant::now();
+
+    while received < count {
+        for ev in endpoint.take_nat_events() {
+            if let NatEvent::PathUpgraded { from, to, .. } = &ev {
+                last_path = path_name(to);
+                upgraded = Some(format!("{} -> {}", path_name(from), last_path));
+            }
+            print_nat("dial", &ev);
+        }
+        match endpoint.next_event(next_send)? {
+            None => {
+                if sent >= count {
+                    next_send = Instant::now() + Duration::from_millis(50);
+                    continue;
+                }
+                sent += 1;
+                let mut frame = encode_header(sent, millis(echo_t0));
+                if payload > 0 {
+                    frame.extend(std::iter::repeat_n(0xCD, payload));
+                }
+                match endpoint.send_stream(&peer, stream, frame) {
+                    Ok(()) => {
+                        outstanding.insert(sent, Instant::now());
+                        next_send = Instant::now() + interval;
+                    }
+                    Err(err) if is_backpressure(&err) => {
+                        sent -= 1;
+                        next_send = Instant::now() + Duration::from_millis(2);
+                    }
+                    Err(err) => return Err(format!("send_stream: {err}").into()),
+                }
+            }
+            Some(Event::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            }) if peer_id == peer && stream_id == stream => {
+                frames.push(&data);
+                while let Some(frame) = frames.pop(frame_len) {
+                    if frame.len() < FRAME_LEN {
+                        continue;
+                    }
+                    let (seq, _) = decode_header(&frame[..FRAME_LEN]);
+                    if let Some(sent_at) = outstanding.remove(&seq) {
+                        received += 1;
+                        rtts.push(sent_at.elapsed().as_micros() as u64);
+                    }
+                }
+            }
+            Some(Event::Error(err)) => return Err(format!("swarm error: {err:?}").into()),
+            Some(_) => {}
+        }
+        if echo_t0.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
+
+    let mut r = DialResult::blank("cli-dial-nat");
+    r.ok = received == count && sent == count;
+    r.sent = sent;
+    r.received = received;
+    r.lost = sent.saturating_sub(received);
+    r.bytes_sent = sent * frame_len as u64;
+    r.bytes_recv = received * frame_len as u64;
+    r.echo_rtts_us = rtts;
+    r.echo_rtt_samples_stored = r.echo_rtts_us.len() as u64;
+    r.wall_ms = t0.elapsed().as_millis() as u64;
+    r.error = Some(match upgraded {
+        Some(u) => format!("first_path={first} upgraded={u} final_path={last_path}"),
+        None => format!("first_path={first} final_path={last_path}"),
+    });
+    Ok(r)
 }

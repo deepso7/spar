@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use minip2p::PeerAddr;
 
-use common::{run_dial_collect, run_listen_loop, DialOpts, TransportKind};
+use common::{parse_dial_target, run_dial_collect, run_dial_nat, run_listen_loop, run_listen_relay, DialOpts, DialTarget, TransportKind};
 use suite::SuiteArgs;
 
 fn main() -> ExitCode {
@@ -48,20 +48,38 @@ fn main() -> ExitCode {
 
     let result = match cmd.as_str() {
         "listen" => match parse_listen(rest, global_transport) {
-            Ok((bind, transport)) => {
+            Ok((bind, transport, relay)) => {
                 let stop = Arc::new(AtomicBool::new(false));
-                let (tx, rx) = mpsc::channel();
                 let stop2 = Arc::clone(&stop);
-                let handle = thread::spawn(move || run_listen_loop(&bind, transport, stop2, tx));
-                if let Ok(addr) = rx.recv() {
-                    println!("[listen] us={}", addr.peer_id());
-                    println!("[listen] addr={addr}");
+                if let Some(relay) = relay {
+                    let (tx, rx) = mpsc::channel::<String>();
+                    let handle = thread::spawn(move || {
+                        run_listen_relay(&bind, transport, relay, stop2, tx)
+                    });
+                    while let Ok(line) = rx.recv_timeout(Duration::from_secs(25)) {
+                        println!("[listen] {line}");
+                        if line.starts_with("circuit=") || line.starts_with("warn=") {
+                            break;
+                        }
+                    }
                     eprintln!(
                         "[listen] transport={} echoing (Ctrl-C to stop)",
                         transport.as_str()
                     );
+                    let _ = handle.join();
+                } else {
+                    let (tx, rx) = mpsc::channel();
+                    let handle = thread::spawn(move || run_listen_loop(&bind, transport, stop2, tx));
+                    if let Ok(addr) = rx.recv() {
+                        println!("[listen] us={}", addr.peer_id());
+                        println!("[listen] addr={addr}");
+                        eprintln!(
+                            "[listen] transport={} echoing (Ctrl-C to stop)",
+                            transport.as_str()
+                        );
+                    }
+                    let _ = handle.join();
                 }
-                let _ = handle.join();
                 Ok(())
             }
             Err(msg) => {
@@ -71,8 +89,19 @@ fn main() -> ExitCode {
             }
         },
         "dial" => match parse_dial(rest, global_transport) {
-            Ok(opts) => {
-                let r = run_dial_collect(opts);
+            Ok((opts, target, relay)) => {
+                let r = if relay.is_some() || matches!(target, DialTarget::Circuit { .. }) {
+                    run_dial_nat(
+                        target,
+                        relay,
+                        opts.count,
+                        opts.interval,
+                        opts.payload,
+                        opts.transport,
+                    )
+                } else {
+                    run_dial_collect(opts)
+                };
                 println!(
                     "[dial] summary name={} ok={} sent={} received={} lost={} avg_rtt_us={:.1} avg_rtt_ms={:.3} p95_us={} bytes_sent={} wall_ms={}",
                     r.name,
@@ -135,8 +164,8 @@ fn usage() {
 spar — sync sparring harness for minip2p (no Tokio/async)
 
 Usage:
-  spar [--transport quic|tcp] listen [--bind HOST:PORT]
-  spar [--transport quic|tcp] dial <peer-multiaddr> [--count N] [--interval MS] [--payload N] [--builtin-ping N]
+  spar [--transport quic|tcp] listen [--bind HOST:PORT] [--relay PEERADDR]
+  spar [--transport quic|tcp] dial <peer-or-circuit> [--relay PEERADDR] [--count N] [--interval MS] [--payload N] [--builtin-ping N]
   spar [--transport quic|tcp] suite [--out DIR] [--deep] [--gossip] [--nat] [--relay PEERADDR]
 
   --transport quic|tcp   wire transport (default quic). Listener + dialers must match.
@@ -152,12 +181,17 @@ Default is a short echo suite. --deep adds long echoes, reconnect-churn-200, 30s
 fn parse_listen(
     mut args: impl Iterator<Item = String>,
     mut transport: TransportKind,
-) -> Result<(String, TransportKind), String> {
+) -> Result<(String, TransportKind, Option<PeerAddr>), String> {
     let mut bind = "127.0.0.1:0".to_string();
+    let mut relay = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => {
                 bind = args.next().ok_or_else(|| "--bind needs a value".to_string())?;
+            }
+            "--relay" => {
+                let v = args.next().ok_or_else(|| "--relay needs a peer multiaddr".to_string())?;
+                relay = Some(PeerAddr::from_str(&v).map_err(|e| format!("bad --relay: {e}"))?);
             }
             "--transport" => {
                 let v = args.next().ok_or_else(|| "--transport needs quic|tcp".to_string())?;
@@ -166,7 +200,7 @@ fn parse_listen(
             other => return Err(format!("unknown listen option: {other}")),
         }
     }
-    Ok((bind, transport))
+    Ok((bind, transport, relay))
 }
 
 fn parse_suite(
@@ -213,17 +247,22 @@ fn parse_suite(
 fn parse_dial(
     mut args: impl Iterator<Item = String>,
     mut transport: TransportKind,
-) -> Result<DialOpts, String> {
+) -> Result<(DialOpts, DialTarget, Option<PeerAddr>), String> {
     let Some(addr_s) = args.next() else {
         return Err("dial requires a peer multiaddr".into());
     };
-    let addr = PeerAddr::from_str(&addr_s).map_err(|e| format!("bad peer addr: {e}"))?;
+    let target = parse_dial_target(&addr_s)?;
     let mut count = 5u64;
     let mut interval_ms = 200u64;
     let mut payload = 0usize;
     let mut builtin_ping = 0u64;
+    let mut relay = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--relay" => {
+                let v = args.next().ok_or_else(|| "--relay needs a peer multiaddr".to_string())?;
+                relay = Some(PeerAddr::from_str(&v).map_err(|e| format!("bad --relay: {e}"))?);
+            }
             "--count" => {
                 count = args
                     .next()
@@ -259,16 +298,28 @@ fn parse_dial(
             other => return Err(format!("unknown dial option: {other}")),
         }
     }
-    Ok(DialOpts {
-        addr,
-        count,
-        interval: Duration::from_millis(interval_ms),
-        payload,
-        builtin_ping,
-        quiet: false,
-        name: "cli-dial".into(),
-        max_echo_duration: None,
-        rtt_sample_stride: 1,
-        transport,
-    })
+    let addr = match &target {
+        DialTarget::Direct(a) => a.clone(),
+        DialTarget::Circuit { relay, peer } => {
+            // Dummy PeerAddr for the non-NAT dial path; NAT dial uses `target`.
+            let _ = peer;
+            relay.clone()
+        }
+    };
+    Ok((
+        DialOpts {
+            addr,
+            count,
+            interval: Duration::from_millis(interval_ms),
+            payload,
+            builtin_ping,
+            quiet: false,
+            name: "cli-dial".into(),
+            max_echo_duration: None,
+            rtt_sample_stride: 1,
+            transport,
+        },
+        target,
+        relay,
+    ))
 }
