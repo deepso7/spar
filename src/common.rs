@@ -189,6 +189,12 @@ pub struct DialResult {
     pub echo_rtts_us: Vec<u64>,
     /// How many echo RTT samples were dropped due to stride/cap (informational).
     pub echo_rtt_samples_stored: u64,
+    pub us: String,
+    pub first_path: String,
+    pub final_path: String,
+    pub punch_attempts: u32,
+    pub punch_upgraded: bool,
+    pub fell_back_to_relay: bool,
 }
 
 impl DialResult {
@@ -218,6 +224,12 @@ impl DialResult {
             builtin_ping_rtts_ms: Vec::new(),
             echo_rtts_us: Vec::new(),
             echo_rtt_samples_stored: 0,
+            us: String::new(),
+            first_path: String::new(),
+            final_path: String::new(),
+            punch_attempts: 0,
+            punch_upgraded: false,
+            fell_back_to_relay: false,
         }
     }
 
@@ -498,6 +510,7 @@ fn run_dial_collect_inner(
         builtin_ping_rtts_ms,
         echo_rtts_us,
         echo_rtt_samples_stored: stored,
+        ..DialResult::blank("")
     })
 }
 
@@ -988,15 +1001,26 @@ fn run_dial_nat_inner(
     let mut rtts = Vec::new();
     let mut next_send = Instant::now();
     let mut last_path = first.clone();
-    let mut upgraded: Option<String> = None;
+    let mut punch_attempts = 0u32;
+    let mut punch_upgraded = false;
+    let mut fell_back = false;
+    let mut fatal: Option<String> = None;
     let frame_len = FRAME_LEN + payload;
     let echo_t0 = Instant::now();
+    let us = endpoint.peer_id().to_string();
 
-    while received < count {
+    while received < count && fatal.is_none() {
         for ev in endpoint.take_nat_events() {
-            if let NatEvent::PathUpgraded { from, to, .. } = &ev {
-                last_path = path_name(to);
-                upgraded = Some(format!("{} -> {}", path_name(from), last_path));
+            match &ev {
+                NatEvent::PathUpgraded { to, .. } => {
+                    last_path = path_name(to);
+                    if matches!(to, Path::DirectDialed | Path::DirectPunched) {
+                        punch_upgraded = true;
+                    }
+                }
+                NatEvent::HolePunchFailed { .. } => punch_attempts += 1,
+                NatEvent::FellBackToRelay { .. } => fell_back = true,
+                _ => {}
             }
             print_nat("dial", &ev);
         }
@@ -1020,7 +1044,9 @@ fn run_dial_nat_inner(
                         sent -= 1;
                         next_send = Instant::now() + Duration::from_millis(2);
                     }
-                    Err(err) => return Err(format!("send_stream: {err}").into()),
+                    Err(err) => {
+                        fatal = Some(format!("send_stream: {err}"));
+                    }
                 }
             }
             Some(Event::StreamData {
@@ -1041,7 +1067,14 @@ fn run_dial_nat_inner(
                     }
                 }
             }
-            Some(Event::Error(err)) => return Err(format!("swarm error: {err:?}").into()),
+            Some(Event::Error(err)) => {
+                let msg = format!("{err:?}");
+                if msg.contains("StreamReset") {
+                    eprintln!("[dial] swarm error (ignored): {err:?}");
+                } else {
+                    fatal = Some(format!("swarm error: {err:?}"));
+                }
+            }
             Some(_) => {}
         }
         if echo_t0.elapsed() > Duration::from_secs(60) {
@@ -1050,7 +1083,13 @@ fn run_dial_nat_inner(
     }
 
     let mut r = DialResult::blank("cli-dial-nat");
-    r.ok = received == count && sent == count;
+    r.us = us;
+    r.first_path = first;
+    r.final_path = last_path;
+    r.punch_attempts = punch_attempts;
+    r.punch_upgraded = punch_upgraded;
+    r.fell_back_to_relay = fell_back;
+    r.ok = fatal.is_none() && received == count && sent == count;
     r.sent = sent;
     r.received = received;
     r.lost = sent.saturating_sub(received);
@@ -1059,9 +1098,6 @@ fn run_dial_nat_inner(
     r.echo_rtts_us = rtts;
     r.echo_rtt_samples_stored = r.echo_rtts_us.len() as u64;
     r.wall_ms = t0.elapsed().as_millis() as u64;
-    r.error = Some(match upgraded {
-        Some(u) => format!("first_path={first} upgraded={u} final_path={last_path}"),
-        None => format!("first_path={first} final_path={last_path}"),
-    });
+    r.error = fatal;
     Ok(r)
 }

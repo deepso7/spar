@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use minip2p::{PeerAddr, PeerId};
+use serde::Serialize;
 
 use common::{
     parse_dial_target, run_dial_collect, run_dial_nat, run_listen_loop, run_listen_relay, DialOpts,
-    DialTarget, TransportKind,
+    DialResult, DialTarget, TransportKind,
 };
 use suite::SuiteArgs;
 
@@ -35,15 +36,13 @@ const PUBLIC_RELAY_TCP: &str =
     about = "Sync sparring harness for minip2p (no Tokio/async)",
     after_help = "\
 Examples:
-  spar listen
-  spar dial /ip4/127.0.0.1/udp/PORT/quic-v1/p2p/PEER
   spar listen --relay
   spar dial --relay 12D3KooW... -n 10 -p 4k
-  spar suite --nat --gossip
+  spar dial --relay 12D3KooW... --json
   spar suite --relay
 
 Bare --relay uses relay.minip2p.com (QUIC or TCP matching -t).
-Dial accepts a direct multiaddr, a full /p2p-circuit/ addr, or a raw peer id with --relay."
+--json prints one JSON object on stdout; progress stays on stderr."
 )]
 struct Cli {
     /// Wire transport. Listener and dialer must match.
@@ -55,6 +54,10 @@ struct Cli {
         global = true
     )]
     transport: CliTransport,
+
+    /// Machine-readable JSON on stdout (progress stays on stderr).
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -79,7 +82,7 @@ impl From<CliTransport> for TransportKind {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Accept echo streams. --relay reserves on a hop and prints circuit=.
+    /// Accept echo streams. --relay reserves on a hop and prints a dial command.
     Listen {
         /// Bind host:port. Relay mode remaps 127.0.0.1:0 to 0.0.0.0:0.
         #[arg(short, long, default_value = "127.0.0.1:0")]
@@ -213,8 +216,9 @@ fn resolve_target(raw: &str, relay: Option<&PeerAddr>) -> Result<DialTarget, Str
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let transport = TransportKind::from(cli.transport);
+    let json = cli.json;
     let result = match cli.command {
-        Command::Listen { bind, relay } => cmd_listen(bind, transport, relay),
+        Command::Listen { bind, relay } => cmd_listen(bind, transport, relay, json),
         Command::Dial {
             target,
             relay,
@@ -222,28 +226,45 @@ fn main() -> ExitCode {
             interval,
             payload,
             ping,
-        } => cmd_dial(target, transport, relay, count, interval, payload, ping),
+        } => cmd_dial(
+            target, transport, relay, count, interval, payload, ping, json,
+        ),
         Command::Suite {
             out,
             deep,
             gossip,
             nat,
             relay,
-        } => cmd_suite(out, deep, gossip, nat, transport, relay),
+        } => cmd_suite(out, deep, gossip, nat, transport, relay, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
+            if json {
+                let _ = writeln_json_error(&err.to_string());
+            } else {
+                eprintln!("error: {err}");
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+fn writeln_json_error(err: &str) -> Result<(), serde_json::Error> {
+    #[derive(Serialize)]
+    struct E<'a> {
+        ok: bool,
+        error: &'a str,
+    }
+    println!("{}", serde_json::to_string(&E { ok: false, error: err })?);
+    Ok(())
 }
 
 fn cmd_listen(
     bind: String,
     transport: TransportKind,
     relay: Option<String>,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let relay = resolve_relay(relay, transport)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -251,11 +272,49 @@ fn cmd_listen(
     if let Some(relay) = relay {
         let (tx, rx) = mpsc::channel::<String>();
         let handle = thread::spawn(move || run_listen_relay(&bind, transport, relay, stop2, tx));
+        let mut us = String::new();
+        let mut circuit = String::new();
+        let mut addr = String::new();
         while let Ok(line) = rx.recv_timeout(Duration::from_secs(25)) {
-            println!("[listen] {line}");
+            if let Some(v) = line.strip_prefix("us=") {
+                us = v.to_string();
+            } else if let Some(v) = line.strip_prefix("circuit=") {
+                circuit = v.to_string();
+            } else if let Some(v) = line.strip_prefix("addr=") {
+                addr = v.to_string();
+            }
+            if !json {
+                println!("[listen] {line}");
+            }
             if line.starts_with("circuit=") || line.starts_with("warn=") {
                 break;
             }
+        }
+        if json {
+            #[derive(Serialize)]
+            struct ListenJson<'a> {
+                event: &'a str,
+                ok: bool,
+                us: &'a str,
+                circuit: &'a str,
+                addr: &'a str,
+                transport: &'a str,
+                next: String,
+            }
+            let report = ListenJson {
+                event: "listening",
+                ok: !circuit.is_empty(),
+                us: &us,
+                circuit: &circuit,
+                addr: &addr,
+                transport: transport.as_str(),
+                next: format!("spar dial --relay {us} -n 10"),
+            };
+            println!("{}", serde_json::to_string(&report)?);
+        } else if !us.is_empty() {
+            println!();
+            println!("  next: spar dial --relay {us} -n 10");
+            println!();
         }
         eprintln!(
             "[listen] transport={} echoing (Ctrl-C to stop)",
@@ -266,9 +325,30 @@ fn cmd_listen(
     } else {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || run_listen_loop(&bind, transport, stop2, tx));
-        if let Ok(addr) = rx.recv() {
-            println!("[listen] us={}", addr.peer_id());
-            println!("[listen] addr={addr}");
+        if let Ok(peer_addr) = rx.recv() {
+            if json {
+                #[derive(Serialize)]
+                struct ListenJson<'a> {
+                    event: &'a str,
+                    ok: bool,
+                    us: String,
+                    addr: String,
+                    transport: &'a str,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string(&ListenJson {
+                        event: "listening",
+                        ok: true,
+                        us: peer_addr.peer_id().to_string(),
+                        addr: peer_addr.to_string(),
+                        transport: transport.as_str(),
+                    })?
+                );
+            } else {
+                println!("[listen] us={}", peer_addr.peer_id());
+                println!("[listen] addr={peer_addr}");
+            }
             eprintln!(
                 "[listen] transport={} echoing (Ctrl-C to stop)",
                 transport.as_str()
@@ -287,6 +367,7 @@ fn cmd_dial(
     interval: u64,
     payload: usize,
     ping: u64,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let relay = resolve_relay(relay, transport)?;
     let parsed = resolve_target(&target, relay.as_ref())?;
@@ -310,34 +391,148 @@ fn cmd_dial(
             interval: Duration::from_millis(interval),
             payload,
             builtin_ping: ping,
-            quiet: false,
+            quiet: json,
             name: "cli-dial".into(),
             max_echo_duration: None,
             rtt_sample_stride: 1,
             transport,
         })
     };
-    println!(
-        "[dial] summary name={} ok={} sent={} received={} lost={} avg_rtt_us={:.1} avg_rtt_ms={:.3} p95_us={} bytes_sent={} wall_ms={}",
-        r.name,
-        r.ok,
-        r.sent,
-        r.received,
-        r.lost,
-        r.avg_echo_rtt_us(),
-        r.avg_echo_rtt(),
-        r.percentile_echo_rtt_us(0.95),
-        r.bytes_sent,
-        r.wall_ms
-    );
-    if let Some(err) = &r.error {
-        eprintln!("[dial] note: {err}");
+    if json {
+        println!("{}", serde_json::to_string(&dial_json(&r, transport.as_str(), &target))?);
+    } else {
+        print_dial_cards(&r);
     }
     if r.ok {
         Ok(())
     } else {
         Err(r.error.unwrap_or_else(|| "dial failed".into()).into())
     }
+}
+
+#[derive(Serialize)]
+struct DialJson<'a> {
+    ok: bool,
+    event: &'a str,
+    name: &'a str,
+    target: &'a str,
+    us: &'a str,
+    transport: &'a str,
+    first_path: &'a str,
+    final_path: &'a str,
+    punch_attempts: u32,
+    punch_upgraded: bool,
+    fell_back_to_relay: bool,
+    difficulty: &'a str,
+    direct_connections: &'a str,
+    sent: u64,
+    received: u64,
+    lost: u64,
+    avg_rtt_ms: f64,
+    p95_rtt_us: u64,
+    bytes_sent: u64,
+    wall_ms: u64,
+    mbps: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+fn difficulty(r: &DialResult) -> (&'static str, &'static str) {
+    if r.punch_upgraded || r.final_path.starts_with("Direct") {
+        ("easy", "Easy NAT + No NAT devices")
+    } else if r.punch_attempts > 0 || r.fell_back_to_relay || r.final_path.starts_with("Relayed") {
+        ("hard", "No NAT devices only (relay required)")
+    } else {
+        ("unknown", "Unknown")
+    }
+}
+
+fn dial_json<'a>(r: &'a DialResult, transport: &'a str, target: &'a str) -> DialJson<'a> {
+    let (diff, direct) = difficulty(r);
+    DialJson {
+        ok: r.ok,
+        event: "dial",
+        name: &r.name,
+        target,
+        us: &r.us,
+        transport,
+        first_path: &r.first_path,
+        final_path: &r.final_path,
+        punch_attempts: r.punch_attempts,
+        punch_upgraded: r.punch_upgraded,
+        fell_back_to_relay: r.fell_back_to_relay,
+        difficulty: diff,
+        direct_connections: direct,
+        sent: r.sent,
+        received: r.received,
+        lost: r.lost,
+        avg_rtt_ms: r.avg_echo_rtt(),
+        p95_rtt_us: r.percentile_echo_rtt_us(0.95),
+        bytes_sent: r.bytes_sent,
+        wall_ms: r.wall_ms,
+        mbps: r.mbps(),
+        error: r.error.as_deref(),
+    }
+}
+
+fn print_dial_cards(r: &DialResult) {
+    let (diff, direct) = difficulty(r);
+    let diff_label = match diff {
+        "easy" => "Easy",
+        "hard" => "Hard",
+        _ => "Unknown",
+    };
+    let status = match diff {
+        "easy" => "Direct path. Punch landed or you were already public.",
+        "hard" => "Stayed Relayed. This NAT pair needs the hop.",
+        _ => "No punch data. Direct dial or the path never came up.",
+    };
+
+    println!();
+    println!("  Path");
+    println!("  ----");
+    if !r.first_path.is_empty() {
+        println!("  first:            {}", r.first_path);
+        println!("  final:            {}", r.final_path);
+        println!("  punch attempts:   {}", r.punch_attempts);
+        println!(
+            "  upgraded:         {}",
+            if r.punch_upgraded { "yes" } else { "no" }
+        );
+        println!(
+            "  fell back:        {}",
+            if r.fell_back_to_relay { "yes" } else { "no" }
+        );
+    } else {
+        println!("  (no NAT path; loopback/direct dial)");
+    }
+    println!("  difficulty:       {diff_label}");
+    println!("  direct:           {direct}");
+    println!();
+    println!("  Echo");
+    println!("  ----");
+    println!(
+        "  frames:           {}/{}  lost {}",
+        r.received, r.sent, r.lost
+    );
+    println!(
+        "  rtt:              {:.1} ms avg   p95 {} us",
+        r.avg_echo_rtt(),
+        r.percentile_echo_rtt_us(0.95)
+    );
+    println!(
+        "  throughput:       {:.2} Mbps   {} bytes in {} ms",
+        r.mbps(),
+        r.bytes_sent,
+        r.wall_ms
+    );
+    println!("  ok:               {}", r.ok);
+    if let Some(err) = &r.error {
+        println!("  error:            {err}");
+    }
+    println!();
+    println!("  {status}");
+    println!();
 }
 
 fn cmd_suite(
@@ -347,8 +542,12 @@ fn cmd_suite(
     nat: bool,
     transport: TransportKind,
     relay: Option<String>,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let relay = resolve_relay(relay, transport)?;
+    if json {
+        eprintln!("[suite] --json writes the usual reports/; stdout is the run dir when done");
+    }
     suite::run_suite(SuiteArgs {
         out_dir: out,
         deep,

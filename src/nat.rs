@@ -112,6 +112,7 @@ fn finish_ok(
         builtin_ping_rtts_ms: Vec::new(),
         echo_rtts_us: rtts,
         echo_rtt_samples_stored: stored,
+        ..DialResult::blank("")
     }
 }
 
