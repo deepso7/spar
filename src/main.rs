@@ -222,7 +222,7 @@ fn main() -> ExitCode {
     let transport = TransportKind::from(cli.transport);
     let json = cli.json;
     let result = match cli.command {
-        Command::Listen { bind, relay } => cmd_listen(bind, transport, relay, json),
+        Command::Listen { bind, relay } => cmd_listen(bind, transport, relay, json).map(|()| true),
         Command::Dial {
             target,
             relay,
@@ -239,10 +239,11 @@ fn main() -> ExitCode {
             gossip,
             nat,
             relay,
-        } => cmd_suite(out, deep, gossip, nat, transport, relay, json),
+        } => cmd_suite(out, deep, gossip, nat, transport, relay, json).map(|()| true),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(err) => {
             if json {
                 let _ = writeln_json_error(&err.to_string());
@@ -372,7 +373,7 @@ fn cmd_dial(
     payload: usize,
     ping: u64,
     json: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let relay = resolve_relay(relay, transport)?;
     let parsed = resolve_target(&target, relay.as_ref())?;
     let r = if relay.is_some() || matches!(parsed, DialTarget::Circuit { .. }) {
@@ -407,11 +408,7 @@ fn cmd_dial(
     } else {
         print_dial_cards(&r);
     }
-    if r.ok {
-        Ok(())
-    } else {
-        Err(r.error.unwrap_or_else(|| "dial failed".into()).into())
-    }
+    Ok(r.ok)
 }
 
 #[derive(Serialize)]

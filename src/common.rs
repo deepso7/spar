@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, EndpointBuilder, Event, PeerAddr, PeerId, StreamId};
 
-pub const AGENT: &str = "spar/0.1.5";
+pub const AGENT: &str = "spar/0.1.6";
 /// Crate version of the sparred stack (minip2p-rs from crates.io).
 pub const STACK: &str = "minip2p-rs 0.4.6";
 pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
@@ -374,11 +374,29 @@ fn wait_stream_ready(
                 return Ok(());
             }
             Event::Error(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("StreamReset") {
+                    continue;
+                }
                 return Err(format!("swarm error while opening stream: {err:?}").into());
             }
             _ => {}
         }
     }
+}
+
+fn open_echo(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+) -> Result<StreamId, Box<dyn std::error::Error + Send + Sync>> {
+    let stream = endpoint.open_stream(peer, ECHO_PROTOCOL)?;
+    wait_stream_ready(endpoint, peer, stream, Duration::from_secs(15))?;
+    Ok(stream)
+}
+
+fn stream_gone(err: &dyn std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("is not active") || msg.contains("StreamNotFound")
 }
 
 fn run_dial_collect_inner(
@@ -837,6 +855,9 @@ fn print_nat(tag: &str, event: &NatEvent) {
         NatEvent::InboundDirectUpgrade { peer } => {
             eprintln!("[{tag}] nat-inbound-direct-upgrade peer={peer}")
         }
+        NatEvent::InboundPathEstablished { peer, path } => {
+            eprintln!("[{tag}] nat-inbound-path peer={peer} path={}", path_name(path))
+        }
         other => eprintln!("[{tag}] nat {other:?}"),
     }
 }
@@ -1026,8 +1047,8 @@ fn run_dial_nat_inner(
     );
 
     let _ = endpoint.wait_peer_ready(&peer, Duration::from_secs(15))?;
-    let stream = endpoint.open_stream(&peer, ECHO_PROTOCOL)?;
-    wait_stream_ready(&mut endpoint, &peer, stream, Duration::from_secs(15))?;
+    let mut stream = open_echo(&mut endpoint, &peer)?;
+    let mut reopen = false;
 
     let mut frames = FrameBuf::default();
     let mut outstanding: HashMap<u64, Instant> = HashMap::new();
@@ -1051,6 +1072,7 @@ fn run_dial_nat_inner(
                     last_path = path_name(to);
                     if matches!(to, Path::DirectDialed | Path::DirectPunched) {
                         punch_upgraded = true;
+                        reopen = true;
                     }
                 }
                 NatEvent::HolePunchFailed { .. } => punch_attempts += 1,
@@ -1059,7 +1081,27 @@ fn run_dial_nat_inner(
             }
             print_nat("dial", &ev);
         }
+        if reopen {
+            match open_echo(&mut endpoint, &peer) {
+                Ok(new_stream) => {
+                    stream = new_stream;
+                    reopen = false;
+                    outstanding.clear();
+                    eprintln!("[dial] echo-stream reopened path={last_path}");
+                }
+                Err(err) => {
+                    eprintln!("[dial] echo-stream reopen failed: {err}");
+                }
+            }
+        }
         match endpoint.next_event(next_send)? {
+            Some(Event::StreamClosed {
+                peer_id,
+                stream_id,
+                ..
+            }) if peer_id == peer && stream_id == stream => {
+                reopen = true;
+            }
             None => {
                 if sent >= count {
                     next_send = Instant::now() + Duration::from_millis(50);
@@ -1078,6 +1120,10 @@ fn run_dial_nat_inner(
                     Err(err) if is_backpressure(&err) => {
                         sent -= 1;
                         next_send = Instant::now() + Duration::from_millis(2);
+                    }
+                    Err(err) if stream_gone(&err) => {
+                        sent -= 1;
+                        reopen = true;
                     }
                     Err(err) => {
                         fatal = Some(format!("send_stream: {err}"));
