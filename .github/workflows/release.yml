@@ -16,36 +16,42 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: linux-amd64
+            rust-target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
-          - os: macos-14
+            rust-target: aarch64-unknown-linux-gnu
+          - os: macos-latest
             artifact: darwin-arm64
-          - os: macos-13
+            rust-target: aarch64-apple-darwin
+          - os: macos-latest
             artifact: darwin-amd64
+            rust-target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
       - name: Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config clang libclang-dev
       - name: macOS bindgen target
         if: runner.os == 'macOS'
-        run: echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=aarch64-apple-darwin" >> "$GITHUB_ENV"
+        run: |
+          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=aarch64-apple-darwin" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin=--target=x86_64-apple-darwin" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.rust-target }}
       - name: Pack
         shell: bash
         run: |
           set -euo pipefail
           name="spar-${GITHUB_REF_NAME}-${{ matrix.artifact }}"
           mkdir "$name"
-          bin="target/release/spar"
-          if [[ -f target/release/spar.exe ]]; then bin=target/release/spar.exe; fi
-          cp "$bin" "$name/spar"
+          cp "target/${{ matrix.rust-target }}/release/spar" "$name/spar"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -56,7 +62,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
