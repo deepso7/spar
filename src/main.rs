@@ -25,9 +25,9 @@ use common::{
 use suite::SuiteArgs;
 
 const PUBLIC_RELAY_QUIC: &str =
-    "/dns4/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+    "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 const PUBLIC_RELAY_TCP: &str =
-    "/dns4/relay.minip2p.com/tcp/19876/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+    "/dns/relay.minip2p.com/tcp/19876/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,7 +41,7 @@ Examples:
   spar dial 12D3KooW... --relay --json
   spar suite --relay
 
-Bare --relay uses relay.minip2p.com (QUIC or TCP matching -t).
+Bare --relay uses relay.minip2p.com (QUIC or TCP matching -t; /dns so A+AAAA).
 Custom hop: --relay=/dns4/host/...
 --json prints one JSON object on stdout; progress stays on stderr."
 )]
@@ -637,5 +637,14 @@ mod cli_parse {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn public_hop_is_dns_not_dns4() {
+        assert!(PUBLIC_RELAY_QUIC.starts_with("/dns/relay.minip2p.com/"));
+        assert!(PUBLIC_RELAY_TCP.starts_with("/dns/relay.minip2p.com/"));
+        assert!(!PUBLIC_RELAY_QUIC.starts_with("/dns4/"));
+        let _ = public_relay(TransportKind::Quic);
+        let _ = public_relay(TransportKind::Tcp);
     }
 }

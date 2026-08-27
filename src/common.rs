@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, EndpointBuilder, Event, PeerAddr, PeerId, StreamId};
 
-pub const AGENT: &str = "spar/0.1.4";
+pub const AGENT: &str = "spar/0.1.5";
 /// Crate version of the sparred stack (minip2p-rs from crates.io).
 pub const STACK: &str = "minip2p-rs 0.4.6";
 pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
