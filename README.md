@@ -39,6 +39,6 @@ spar suite --gossip --nat
 spar suite --relay
 ```
 
-`-t/--transport` is global (default `quic`). Bare `--relay` uses `relay.minip2p.com`. Dial accepts a direct multiaddr, a `/p2p-circuit/` addr, or a raw peer id with `--relay`. Payload takes `4k` / `64k`.
+`-t/--transport` is global (default `quic`). Bare `--relay` uses `relay.minip2p.com`. Custom hop is `--relay=ADDR` (equals required so a peer id after `--relay` stays the target). Dial accepts a direct multiaddr, a `/p2p-circuit/` addr, or a raw peer id with `--relay`. Payload takes `4k` / `64k`.
 
 Suite writes `reports/run-*/report.md`, `report.json`, and `memory.csv`.

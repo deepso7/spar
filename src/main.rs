@@ -42,6 +42,7 @@ Examples:
   spar suite --relay
 
 Bare --relay uses relay.minip2p.com (QUIC or TCP matching -t).
+Custom hop: --relay=/dns4/host/...
 --json prints one JSON object on stdout; progress stays on stderr."
 )]
 struct Cli {
@@ -93,6 +94,7 @@ enum Command {
             long,
             num_args = 0..=1,
             default_missing_value = "public",
+            require_equals = true,
             value_name = "ADDR"
         )]
         relay: Option<String>,
@@ -107,6 +109,7 @@ enum Command {
             long,
             num_args = 0..=1,
             default_missing_value = "public",
+            require_equals = true,
             value_name = "ADDR"
         )]
         relay: Option<String>,
@@ -148,6 +151,7 @@ enum Command {
             long,
             num_args = 0..=1,
             default_missing_value = "public",
+            require_equals = true,
             value_name = "ADDR"
         )]
         relay: Option<String>,
@@ -556,4 +560,56 @@ fn cmd_suite(
         transport,
         relay,
     })
+}
+
+#[cfg(test)]
+mod cli_parse {
+    use super::*;
+
+    #[test]
+    fn relay_flag_does_not_eat_peer_id() {
+        let cli = Cli::try_parse_from([
+            "spar",
+            "dial",
+            "--relay",
+            "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4",
+            "-n",
+            "10",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Dial {
+                target, relay, count, ..
+            } => {
+                assert_eq!(
+                    target,
+                    "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4"
+                );
+                assert_eq!(relay.as_deref(), Some("public"));
+                assert_eq!(count, 10);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_equals_sets_custom_hop() {
+        let cli = Cli::try_parse_from([
+            "spar",
+            "dial",
+            "--relay=/dns4/hop.example/udp/1/quic-v1",
+            "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Dial { target, relay, .. } => {
+                assert_eq!(
+                    target,
+                    "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4"
+                );
+                assert_eq!(relay.as_deref(), Some("/dns4/hop.example/udp/1/quic-v1"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }
