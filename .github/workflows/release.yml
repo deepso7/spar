@@ -1,0 +1,70 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-amd64
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+          - os: macos-14
+            artifact: darwin-arm64
+          - os: macos-13
+            artifact: darwin-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config clang libclang-dev
+      - name: macOS bindgen target
+        if: runner.os == 'macOS'
+        run: echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=aarch64-apple-darwin" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="spar-${GITHUB_REF_NAME}-${{ matrix.artifact }}"
+          mkdir "$name"
+          bin="target/release/spar"
+          if [[ -f target/release/spar.exe ]]; then bin=target/release/spar.exe; fi
+          cp "$bin" "$name/spar"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            spar-*.tar.gz
+            spar-*.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/spar-*.tar.gz dist/spar-*.tar.gz.sha256 \
+            --generate-notes --repo "${GITHUB_REPOSITORY}" \
+            || gh release upload "${GITHUB_REF_NAME}" dist/spar-*.tar.gz dist/spar-*.tar.gz.sha256 --clobber --repo "${GITHUB_REPOSITORY}"
