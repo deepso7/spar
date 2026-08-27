@@ -5,9 +5,9 @@ use std::fs;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, PeerAddr, PeerId, StreamId};
+use minip2p::{Endpoint, EndpointBuilder, Event, PeerAddr, PeerId, StreamId};
 
-pub const AGENT: &str = "spar/0.1.0";
+pub const AGENT: &str = "spar/0.1.4";
 /// Crate version of the sparred stack (minip2p-rs from crates.io).
 pub const STACK: &str = "minip2p-rs 0.4.6";
 pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
@@ -57,19 +57,51 @@ impl TransportKind {
     }
 }
 
+fn wants_dual_stack(bind: &str) -> bool {
+    bind == "0.0.0.0:0"
+}
+
+fn bind_endpoint(
+    make: impl Fn() -> EndpointBuilder,
+    transport: TransportKind,
+    bind: &str,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    match transport {
+        TransportKind::Quic if wants_dual_stack(bind) => match make().bind_quic_dual_stack() {
+            Ok(endpoint) => Ok(endpoint),
+            Err(err) => {
+                eprintln!("[spar] QUIC IPv6 wildcard unavailable ({err}); listening on {bind}");
+                Ok(make().bind_quic(bind)?)
+            }
+        },
+        TransportKind::Quic => Ok(make().bind_quic(bind)?),
+        TransportKind::Tcp if wants_dual_stack(bind) => {
+            match make().tcp("0.0.0.0:0").tcp("[::]:0").bind() {
+                Ok(endpoint) => Ok(endpoint),
+                Err(err) => {
+                    eprintln!("[spar] TCP IPv6 wildcard unavailable ({err}); listening on {bind}");
+                    Ok(make().bind_tcp(bind)?)
+                }
+            }
+        }
+        TransportKind::Tcp => Ok(make().bind_tcp(bind)?),
+    }
+}
+
 pub fn build_endpoint(
     bind: Option<&str>,
     transport: TransportKind,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     let addr = bind.unwrap_or("127.0.0.1:0");
-    let builder = Endpoint::builder()
-        .agent_version(AGENT)
-        .protocol(ECHO_PROTOCOL);
-    let endpoint = match transport {
-        TransportKind::Quic => builder.bind_quic(addr)?,
-        TransportKind::Tcp => builder.bind_tcp(addr)?,
-    };
-    Ok(endpoint)
+    bind_endpoint(
+        || {
+            Endpoint::builder()
+                .agent_version(AGENT)
+                .protocol(ECHO_PROTOCOL)
+        },
+        transport,
+        addr,
+    )
 }
 
 pub fn encode_header(seq: u64, send_ms: u64) -> Vec<u8> {
@@ -753,23 +785,26 @@ fn build_nat_endpoint(
     policy: ReservationPolicy,
     force_relay: bool,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cfg = NatConfig {
-        reservation_policy: policy,
-        force_relay,
-        ..NatConfig::default()
-    };
-    cfg.relays.extend(relays.iter().cloned());
-    let mut builder = Endpoint::builder()
-        .agent_version(AGENT)
-        .protocol(ECHO_PROTOCOL)
-        .nat_config(cfg);
-    for r in relays {
-        builder = builder.relay(r.clone());
-    }
-    Ok(match transport {
-        TransportKind::Quic => builder.bind_quic(bind)?,
-        TransportKind::Tcp => builder.bind_tcp(bind)?,
-    })
+    bind_endpoint(
+        || {
+            let mut cfg = NatConfig {
+                reservation_policy: policy,
+                force_relay,
+                ..NatConfig::default()
+            };
+            cfg.relays.extend(relays.iter().cloned());
+            let mut builder = Endpoint::builder()
+                .agent_version(AGENT)
+                .protocol(ECHO_PROTOCOL)
+                .nat_config(cfg);
+            for r in relays {
+                builder = builder.relay(r.clone());
+            }
+            builder
+        },
+        transport,
+        bind,
+    )
 }
 
 fn print_nat(tag: &str, event: &NatEvent) {
@@ -1100,4 +1135,26 @@ fn run_dial_nat_inner(
     r.wall_ms = t0.elapsed().as_millis() as u64;
     r.error = fatal;
     Ok(r)
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_quic_advertises_ipv6_when_kernel_has_it() {
+        let mut endpoint = build_endpoint(Some("0.0.0.0:0"), TransportKind::Quic).expect("bind");
+        let addrs = endpoint.listen_all().expect("listen");
+        let joined: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        assert!(
+            joined.iter().any(|a| a.contains("/ip4/")),
+            "missing ipv4 listen addr: {joined:?}"
+        );
+        if std::net::UdpSocket::bind("[::]:0").is_ok() {
+            assert!(
+                joined.iter().any(|a| a.contains("/ip6/")),
+                "missing ipv6 listen addr: {joined:?}"
+            );
+        }
+    }
 }

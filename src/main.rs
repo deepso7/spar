@@ -85,7 +85,7 @@ impl From<CliTransport> for TransportKind {
 enum Command {
     /// Accept echo streams. --relay reserves on a hop and prints a dial command.
     Listen {
-        /// Bind host:port. Relay mode remaps 127.0.0.1:0 to 0.0.0.0:0.
+        /// Bind host:port. Relay mode remaps 127.0.0.1:0 to dual-stack wildcards (v4+v6 if present).
         #[arg(short, long, default_value = "127.0.0.1:0")]
         bind: String,
         /// Circuit Relay v2 hop. Bare --relay uses relay.minip2p.com.
