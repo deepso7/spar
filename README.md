@@ -9,7 +9,7 @@ curl -fsSL https://raw.githubusercontent.com/deepso7/spar/main/scripts/install.s
 spar listen --relay
 ```
 
-Puts the binary in `~/.local/bin`. Override with `SPAR_INSTALL_DIR`. Pin a release with `SPAR_VERSION=0.1.1`.
+Puts the binary in `~/.local/bin`. Override with `SPAR_INSTALL_DIR`. Pin a release with `SPAR_VERSION=0.1.2`.
 
 Prebuilts: Linux amd64/arm64, macOS Apple Silicon and Intel. GitHub Actions builds them on `v*` tags.
 
@@ -21,11 +21,11 @@ On the listener:
 spar listen --relay
 ```
 
-Copy the printed `spar dial --relay 12D3KooW...` line onto the other machine:
+Copy the printed `spar dial 12D3KooW... --relay` line onto the other machine:
 
 ```bash
-spar dial --relay 12D3KooW... -n 10
-spar dial --relay 12D3KooW... --json
+spar dial 12D3KooW... --relay -n 10
+spar dial 12D3KooW... --relay --json
 ```
 
 Dial prints a path/echo card (first path, punch attempts, Easy/Hard, RTT). `--json` is one object on stdout for agents.
@@ -39,6 +39,6 @@ spar suite --gossip --nat
 spar suite --relay
 ```
 
-`-t/--transport` is global (default `quic`). Bare `--relay` uses `relay.minip2p.com`. Custom hop is `--relay=ADDR` (equals required so a peer id after `--relay` stays the target). Dial accepts a direct multiaddr, a `/p2p-circuit/` addr, or a raw peer id with `--relay`. Payload takes `4k` / `64k`.
+`-t/--transport` is global (default `quic`). Bare `--relay` uses `relay.minip2p.com`. Custom hop is `--relay=ADDR`. Dial a listener peer through the hop with `spar dial <peer> --relay`. Payload takes `4k` / `64k`.
 
 Suite writes `reports/run-*/report.md`, `report.json`, and `memory.csv`.

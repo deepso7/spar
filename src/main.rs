@@ -37,8 +37,8 @@ const PUBLIC_RELAY_TCP: &str =
     after_help = "\
 Examples:
   spar listen --relay
-  spar dial --relay 12D3KooW... -n 10 -p 4k
-  spar dial --relay 12D3KooW... --json
+  spar dial 12D3KooW... --relay -n 10 -p 4k
+  spar dial 12D3KooW... --relay --json
   spar suite --relay
 
 Bare --relay uses relay.minip2p.com (QUIC or TCP matching -t).
@@ -101,7 +101,7 @@ enum Command {
     },
     /// Echo a peer: direct multiaddr, full circuit, or peer id with --relay.
     Dial {
-        /// Peer multiaddr, /p2p-circuit/ addr, or raw peer id (needs --relay).
+        /// Listener multiaddr, /p2p-circuit/ addr, or listener peer id (add --relay).
         target: String,
         /// Circuit Relay v2 hop. Bare --relay uses relay.minip2p.com.
         #[arg(
@@ -212,7 +212,7 @@ fn resolve_target(raw: &str, relay: Option<&PeerAddr>) -> Result<DialTarget, Str
         format!("invalid target {raw:?}: {e} (want a multiaddr, circuit addr, or peer id)")
     })?;
     let Some(relay) = relay.cloned() else {
-        return Err("bare peer id needs --relay (or pass a full multiaddr)".into());
+        return Err("bare peer id needs --relay after the listener (spar dial <peer> --relay)".into());
     };
     Ok(DialTarget::Circuit { relay, peer })
 }
@@ -312,12 +312,12 @@ fn cmd_listen(
                 circuit: &circuit,
                 addr: &addr,
                 transport: transport.as_str(),
-                next: format!("spar dial --relay {us} -n 10"),
+                next: format!("spar dial {us} --relay -n 10"),
             };
             println!("{}", serde_json::to_string(&report)?);
         } else if !us.is_empty() {
             println!();
-            println!("  next: spar dial --relay {us} -n 10");
+            println!("  next: spar dial {us} --relay -n 10");
             println!();
         }
         eprintln!(
@@ -565,6 +565,32 @@ fn cmd_suite(
 #[cfg(test)]
 mod cli_parse {
     use super::*;
+
+    #[test]
+    fn dial_peer_then_relay() {
+        let cli = Cli::try_parse_from([
+            "spar",
+            "dial",
+            "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4",
+            "--relay",
+            "-n",
+            "10",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Dial {
+                target, relay, count, ..
+            } => {
+                assert_eq!(
+                    target,
+                    "12D3KooWN2XgqhhWMfxAZPNoDLjtYsKFvpjGWuZMEdZ3RMTTHaa4"
+                );
+                assert_eq!(relay.as_deref(), Some("public"));
+                assert_eq!(count, 10);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn relay_flag_does_not_eat_peer_id() {
