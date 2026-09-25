@@ -413,7 +413,7 @@ fn run_nopath(
             0,
             0,
             Vec::new(),
-            "ConnectFailed/NoPathAvailable (expected)".into(),
+            "ConnectSettled/NoUsableRoute (expected)".into(),
         ))
     })();
     record_mem(mem_log, suite_t0, &format!("after-{name}"));
