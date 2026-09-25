@@ -783,7 +783,7 @@ fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool, gossip: bool, 
     lines.push("- **Harness:** `FrameBuf::pop` returns a slice (no per-frame `.to_vec()`). Listener uses `HashMap<PeerId, HashSet<StreamId>>` and moves `data` into `send_stream`.".into());
     lines.push("- **Harness:** Endpoint-per-dial in reconnect churn is intentional (unique PeerId dial/drop). Each iter pays handshake + identify + stream open.".into());
     lines.push("- **Library:** Builtin ping API returns **milliseconds only**; sub-ms pings collapse to 0/1. Echo path uses µs.".into());
-    lines.push("- **Library:** Identify on every reconnect is mandatory today; churn cost is dominated by handshake+identify, not echo RTT.".into());
+    lines.push("- **Library:** Identify (`PeerReady`) is optional before `open_stream`; spar still waits for it on loopback dials to keep identify_ms in reports.".into());
     if deep {
         if let Some(long64) = results.iter().find(|r| r.name == "long-echo-50x64KiB") {
             lines.push(format!(
@@ -795,11 +795,11 @@ fn findings(results: &[DialResult], mem: &MemVerdict, deep: bool, gossip: bool, 
         }
     }
     if gossip {
-        lines.push("- Gossip scenarios drive all endpoints on one thread (round-robin `next_event` + `take_pubsub_events`); pubsub streams must not leak as app StreamReady.".into());
+        lines.push("- Gossip scenarios drive all endpoints on one thread (round-robin `wait`); Gossipsub output arrives as `EndpointEvent::Gossipsub`. Pubsub streams must not leak as app StreamReady.".into());
         lines.push("- Caveat: loopback gossipsub only — mesh is a star (1 listener, N-1 dial). Not a WAN/relay mesh.".into());
     }
     if nat {
-        lines.push("- NAT scenarios drive application endpoints on one thread (round-robin `next_event`); the NAT agent is fed by that poll. `nat-nopath` is a pass when `ConnectFailed`/`NoPathAvailable`. Circuit uses a compact loopback hop (HOP/STOP + byte-copy). Loopback circuits stay Relayed.".into());
+        lines.push("- NAT scenarios drive application endpoints on one thread (round-robin `wait`); NAT output arrives as `EndpointEvent::Nat`. `nat-nopath` is a pass when `ConnectSettled`/`NoUsableRoute`. Circuit uses a compact loopback hop (HOP/STOP + byte-copy). Loopback circuits stay Relayed.".into());
     }
     if !gossip && !nat {
         lines.push("- Caveat: loopback only — measures sync Endpoint under spar’s echo protocol (QUIC or TCP), not gossipsub/relay/WAN.".into());

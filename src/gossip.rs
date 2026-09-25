@@ -1,15 +1,18 @@
-//! Loopback gossipsub scenarios. One thread, round-robin `next_event`.
+//! Loopback gossipsub scenarios. One thread, round-robin `wait`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, Event, PublishError, PubsubError, PubsubEvent, FLOODSUB_PROTOCOL_ID,
-    MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11,
+    Endpoint, EndpointEvent, GossipsubError, GossipsubEvent, PublishError, MESHSUB_PROTOCOL_ID_V10,
+    MESHSUB_PROTOCOL_ID_V11,
 };
 
-use crate::common::{sample_mem, DialResult, MemSample, TransportKind, AGENT, MAX_RTT_SAMPLES};
+use crate::common::{
+    listen_multiaddr, sample_mem, wait_duration, DialResult, MemSample, TransportKind, AGENT,
+    MAX_RTT_SAMPLES,
+};
 
 pub const GOSSIP_TOPIC: &str = "/spar/gossip/1";
 const SLICE: Duration = Duration::from_millis(1);
@@ -38,18 +41,12 @@ impl Stats {
 }
 
 fn is_pubsub_protocol(id: &str) -> bool {
-    matches!(
-        id,
-        FLOODSUB_PROTOCOL_ID | MESHSUB_PROTOCOL_ID_V10 | MESHSUB_PROTOCOL_ID_V11
-    )
+    matches!(id, MESHSUB_PROTOCOL_ID_V10 | MESHSUB_PROTOCOL_ID_V11)
 }
 
 fn build_ep(transport: TransportKind) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let b = Endpoint::builder().agent_version(AGENT).pubsub();
-    Ok(match transport {
-        TransportKind::Quic => b.bind_quic("127.0.0.1:0")?,
-        TransportKind::Tcp => b.bind_tcp("127.0.0.1:0")?,
-    })
+    let b = Endpoint::builder().agent_version(AGENT).gossipsub();
+    Ok(b.listen_on(listen_multiaddr("127.0.0.1:0", transport)?)?.bind()?)
 }
 
 fn stamp(seq: u64, send_us: u64, pad: usize) -> Vec<u8> {
@@ -72,32 +69,33 @@ fn decode(data: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
-fn drive(eps: &mut [Endpoint], stats: &mut Stats, start: usize) -> Vec<Vec<PubsubEvent>> {
+fn drive(eps: &mut [Endpoint], stats: &mut Stats, start: usize) -> Vec<Vec<GossipsubEvent>> {
     let n = eps.len();
     let mut out = vec![Vec::new(); n];
     for k in 0..n {
         let i = (start + k) % n;
-        match eps[i].next_event(SLICE) {
-            Ok(Some(Event::StreamReady { protocol_id, .. })) if is_pubsub_protocol(&protocol_id) => {
+        match wait_duration(&mut eps[i], SLICE) {
+            Ok(Some(EndpointEvent::StreamReady { protocol_id, .. }))
+                if is_pubsub_protocol(&protocol_id) =>
+            {
                 stats.leaks += 1;
             }
-            Ok(Some(Event::Error(err))) => stats.errors.push(format!("swarm error: {err:?}")),
-            Err(err) => stats.errors.push(format!("next_event: {err}")),
-            _ => {}
-        }
-        let events = eps[i].take_pubsub_events();
-        for ev in &events {
-            if let PubsubEvent::ProtocolViolation { reason, .. } = ev {
-                stats.errors.push(format!("protocol_violation: {reason}"));
+            Ok(Some(EndpointEvent::Gossipsub(event))) => {
+                if let GossipsubEvent::ProtocolViolation { reason, .. } = &event {
+                    stats.errors.push(format!("protocol_violation: {reason}"));
+                }
+                out[i].push(event);
             }
+            Ok(Some(EndpointEvent::Error(err))) => stats.errors.push(format!("swarm error: {err:?}")),
+            Ok(Some(_) | None) => {}
+            Err(err) => stats.errors.push(format!("wait: {err}")),
         }
-        out[i] = events;
     }
     out
 }
 
 fn ingest(
-    events: &[PubsubEvent],
+    events: &[GossipsubEvent],
     got: &mut HashSet<u64>,
     lats: &mut Vec<u64>,
     t0: Instant,
@@ -105,7 +103,7 @@ fn ingest(
     is_pub: bool,
 ) {
     for ev in events {
-        let PubsubEvent::Message { data, topics, .. } = ev else {
+        let GossipsubEvent::Message { data, topics, .. } = ev else {
             continue;
         };
         if !topics.is_empty() && !topics.iter().any(|t| t == GOSSIP_TOPIC) {
@@ -140,17 +138,17 @@ fn ingest_all(
     }
 }
 
-fn sub_count(events: &[PubsubEvent]) -> usize {
+fn sub_count(events: &[GossipsubEvent]) -> usize {
     events
         .iter()
-        .filter(|e| matches!(e, PubsubEvent::PeerSubscribed { topic, .. } if topic == GOSSIP_TOPIC))
+        .filter(|e| matches!(e, GossipsubEvent::PeerSubscribed { topic, .. } if topic == GOSSIP_TOPIC))
         .count()
 }
 
-fn saw_unsub(events: &[PubsubEvent]) -> bool {
+fn saw_unsub(events: &[GossipsubEvent]) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, PubsubEvent::PeerUnsubscribed { topic, .. } if topic == GOSSIP_TOPIC))
+        .any(|e| matches!(e, GossipsubEvent::PeerUnsubscribed { topic, .. } if topic == GOSSIP_TOPIC))
 }
 
 /// Star: node 0 listens, others dial. Everyone subscribes first.
@@ -171,11 +169,11 @@ fn setup_star(
         let _ = ep.subscribe(GOSSIP_TOPIC)?;
     }
     for ep in eps.iter_mut().skip(1) {
-        ep.dial(&hub)?;
+        ep.connect(&hub)?;
     }
     let leaves = n - 1;
     let until = Instant::now() + MESH_DEADLINE;
-    let mut all: Vec<Vec<PubsubEvent>> = vec![Vec::new(); n];
+    let mut all: Vec<Vec<GossipsubEvent>> = vec![Vec::new(); n];
     loop {
         let hub_ok = sub_count(&all[0]) >= leaves;
         let leaves_ok = all[1..].iter().all(|ev| sub_count(ev) >= 1);
@@ -225,7 +223,7 @@ fn publish_all(
                 bytes += len;
                 ingest_all(eps, pub_idx, stats, got, lats, t0, self_del);
             }
-            Err(PubsubError::Publish(PublishError::Backpressure)) => {
+            Err(GossipsubError::Publish(PublishError::Backpressure)) => {
                 ingest_all(eps, pub_idx, stats, got, lats, t0, self_del);
             }
             Err(e) => return Err(format!("publish seq {seq}: {e}").into()),
@@ -459,7 +457,7 @@ fn run_unsub(
             loop {
                 match eps[pub_idx].publish(GOSSIP_TOPIC, data.clone()) {
                     Ok(()) => break,
-                    Err(PubsubError::Publish(PublishError::Backpressure)) => {
+                    Err(GossipsubError::Publish(PublishError::Backpressure)) => {
                         ingest_all(&mut eps, pub_idx, &mut stats, &mut got, &mut lats, t0, &mut self_del);
                     }
                     Err(e) => return Err(format!("post-unsub publish: {e}").into()),
@@ -472,7 +470,7 @@ fn run_unsub(
         while Instant::now() < watch {
             let step = drive(&mut eps, &mut stats, pub_idx);
             for ev in &step[sub_idx] {
-                if let PubsubEvent::Message { data, .. } = ev
+                if let GossipsubEvent::Message { data, .. } = ev
                     && let Some((seq, _)) = decode(data)
                     && seq > first_n
                 {

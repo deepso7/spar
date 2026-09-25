@@ -5,7 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use minip2p::{Endpoint, Event, PeerAddr, PeerId, StreamId};
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId};
 use minip2p_relay::{
     decode_frame, encode_frame, FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status,
     StopMessage, StopMessageType, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID,
@@ -76,9 +76,9 @@ fn stop_connect(initiator: &PeerId) -> Vec<u8> {
 }
 
 impl Hop {
-    fn handle(&mut self, ep: &mut Endpoint, event: Event) -> Result<(), String> {
+    fn handle(&mut self, ep: &mut Endpoint, event: EndpointEvent) -> Result<(), String> {
         match event {
-            Event::StreamReady {
+            EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -87,7 +87,7 @@ impl Hop {
             } if protocol_id == HOP_PROTOCOL_ID => {
                 self.hop_buf.entry((peer_id, stream_id)).or_default();
             }
-            Event::StreamReady {
+            EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -99,23 +99,23 @@ impl Hop {
                 ep.send_stream(&peer_id, stream_id, bytes)
                     .map_err(|e| format!("send STOP CONNECT: {e}"))?;
             }
-            Event::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
                 ..
             } => self.on_data(ep, (peer_id, stream_id), data)?,
-            Event::StreamRemoteWriteClosed {
+            EndpointEvent::StreamRemoteWriteClosed {
                 peer_id, stream_id, ..
             } => {
                 if let Some((other, sid)) = self.bridge.get(&(peer_id, stream_id)).cloned() {
                     let _ = ep.close_stream_write(&other, sid);
                 }
             }
-            Event::StreamClosed {
+            EndpointEvent::StreamClosed {
                 peer_id, stream_id, ..
             } => self.drop_stream(ep, &(peer_id, stream_id)),
-            Event::ConnectionClosed { peer_id, .. } => {
+            EndpointEvent::ConnectionClosed { peer_id, .. } => {
                 let dead: Vec<_> = self
                     .bridge
                     .keys()
@@ -263,8 +263,14 @@ impl RelayServer {
                 .protocol(HOP_PROTOCOL_ID)
                 .protocol(STOP_PROTOCOL_ID);
             match transport {
-                TransportKind::Quic => b.bind_quic("127.0.0.1:0").map_err(|e| format!("relay bind: {e}"))?,
-                TransportKind::Tcp => b.bind_tcp("127.0.0.1:0").map_err(|e| format!("relay bind: {e}"))?,
+                TransportKind::Quic => b
+                    .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                    .and_then(|b| b.bind())
+                    .map_err(|e| format!("relay bind: {e}"))?,
+                TransportKind::Tcp => b
+                    .listen_on("/ip4/127.0.0.1/tcp/0")
+                    .and_then(|b| b.bind())
+                    .map_err(|e| format!("relay bind: {e}"))?,
             }
         };
         let addr = ep.listen().map_err(|e| format!("relay listen: {e}"))?;
@@ -278,14 +284,14 @@ impl RelayServer {
                     Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
-                match ep.next_event(Duration::from_millis(10)) {
-                    Ok(Some(event)) => {
+                match ep.wait(Duration::from_millis(10)) {
+                    Ok(EndpointWaitOutcome::Event(event)) => {
                         if let Err(e) = hop.handle(&mut ep, event) {
                             *sink.lock().expect("relay err") = Some(e);
                             break;
                         }
                     }
-                    Ok(None) => {}
+                    Ok(EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted) => {}
                     Err(e) => {
                         *sink.lock().expect("relay err") = Some(format!("relay endpoint: {e}"));
                         break;
