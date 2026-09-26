@@ -1,18 +1,18 @@
 //! Loopback NAT + circuit-relay scenarios. App endpoints share one thread
-//! and are driven round-robin; the NAT agent is fed by `next_event`.
+//! and are driven round-robin; NAT output arrives as `EndpointEvent::Nat`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectId, Ed25519Keypair, Endpoint, Event, NatConfig, NatError, NatEvent, Path, PeerAddr,
-    PeerId, ReservationPolicy, StreamId,
+    ConnectFailure, ConnectId, ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, NatConfig,
+    NatEvent, Path, PeerAddr, PeerId, ReservationPolicy, StreamId,
 };
 
 use crate::common::{
-    decode_header, encode_header, sample_mem, DialResult, FrameBuf, MemSample, TransportKind,
-    AGENT, ECHO_PROTOCOL, FRAME_LEN, MAX_RTT_SAMPLES,
+    decode_header, encode_header, listen_multiaddr, sample_mem, wait_duration, DialResult, FrameBuf,
+    MemSample, TransportKind, AGENT, ECHO_PROTOCOL, FRAME_LEN, MAX_RTT_SAMPLES,
 };
 use crate::relay::RelayServer;
 
@@ -46,8 +46,12 @@ fn bind_on(
     listen: &str,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     Ok(match transport {
-        TransportKind::Quic => builder.bind_quic(listen)?,
-        TransportKind::Tcp => builder.bind_tcp(listen)?,
+        TransportKind::Quic => builder
+            .listen_on(listen_multiaddr(listen, transport).map_err(|e| e.to_string())?)?
+            .bind()?,
+        TransportKind::Tcp => builder
+            .listen_on(listen_multiaddr(listen, transport).map_err(|e| e.to_string())?)?
+            .bind()?,
     })
 }
 
@@ -122,12 +126,12 @@ fn wrap_fail(name: &str, t0: Instant, err: impl ToString) -> DialResult {
     r
 }
 
-fn drive_step(eps: &mut [Endpoint], start: usize) -> Result<Vec<Vec<Event>>, String> {
+fn drive_step(eps: &mut [Endpoint], start: usize) -> Result<Vec<Vec<EndpointEvent>>, String> {
     let n = eps.len();
     let mut collected = vec![Vec::new(); n];
     for k in 0..n {
         let i = (start + k) % n;
-        match eps[i].next_event(SLICE).map_err(|e| format!("next_event: {e}"))? {
+        match wait_duration(&mut eps[i], SLICE).map_err(|e| format!("wait: {e}"))? {
             Some(ev) => collected[i].push(ev),
             None => {}
         }
@@ -135,15 +139,52 @@ fn drive_step(eps: &mut [Endpoint], start: usize) -> Result<Vec<Vec<Event>>, Str
     Ok(collected)
 }
 
-fn wait_peer_ready_rr(eps: &mut [Endpoint], idx: usize, peer: &PeerId, deadline: Duration) -> Result<(), String> {
+fn wait_path_established(
+    eps: &mut [Endpoint],
+    init: usize,
+    remote: &PeerId,
+    id: ConnectId,
+    deadline: Duration,
+) -> Result<(Path, u64), String> {
+    let t0 = Instant::now();
     let until = Instant::now() + deadline;
-    while !eps[idx].is_peer_ready(peer) {
-        if Instant::now() >= until {
-            return Err(format!("identify timed out for {peer}"));
+    let mut failed: Option<String> = None;
+    loop {
+        let step = drive_step(eps, init)?;
+        for event in &step[init] {
+            match event {
+                EndpointEvent::Nat(NatEvent::PathEstablished {
+                    connect_id, path, ..
+                }) if *connect_id == id => {
+                    return Ok((path.clone(), t0.elapsed().as_millis() as u64));
+                }
+                EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome,
+                    ..
+                } if *connect_id == id => match outcome {
+                    ConnectOutcome::Connected { .. } => {
+                        if let Some(path) = eps[init].path(remote) {
+                            return Ok((path, t0.elapsed().as_millis() as u64));
+                        }
+                    }
+                    ConnectOutcome::Failed(err) => {
+                        failed = Some(format!("ConnectSettled failed: {err:?}"));
+                    }
+                    ConnectOutcome::Cancelled => {
+                        failed = Some("ConnectSettled cancelled".into());
+                    }
+                },
+                _ => {}
+            }
         }
-        let _ = drive_step(eps, idx)?;
+        if let Some(msg) = failed {
+            return Err(msg);
+        }
+        if Instant::now() >= until {
+            return Err(format!("wait_path timed out after {deadline:?}"));
+        }
     }
-    Ok(())
 }
 
 fn echo_n(
@@ -154,7 +195,6 @@ fn echo_n(
 ) -> Result<(u64, u64, u64, u64, Vec<u64>), String> {
     let resp_peer = eps[resp].peer_id().clone();
     let init_peer = eps[init].peer_id().clone();
-    wait_peer_ready_rr(eps, init, &resp_peer, Duration::from_secs(10))?;
     let stream = eps[init]
         .open_stream(&resp_peer, ECHO_PROTOCOL)
         .map_err(|e| format!("open_stream: {e}"))?;
@@ -168,7 +208,7 @@ fn echo_n(
         }
         let step = drive_step(eps, init)?;
         for ev in &step[init] {
-            if let Event::StreamReady {
+            if let EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -183,7 +223,7 @@ fn echo_n(
             }
         }
         for ev in &step[resp] {
-            if let Event::StreamReady {
+            if let EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -225,7 +265,7 @@ fn echo_n(
         }
         let step = drive_step(eps, init)?;
         for ev in &step[resp] {
-            if let Event::StreamData {
+            if let EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -240,7 +280,7 @@ fn echo_n(
             }
         }
         for ev in &step[init] {
-            if let Event::StreamData {
+            if let EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -269,39 +309,6 @@ fn echo_n(
     Ok((sent, received, bytes_sent, bytes_recv, rtts))
 }
 
-fn wait_path_established(
-    eps: &mut [Endpoint],
-    init: usize,
-    id: ConnectId,
-    deadline: Duration,
-) -> Result<(Path, u64), String> {
-    let t0 = Instant::now();
-    let until = Instant::now() + deadline;
-    let mut failed: Option<String> = None;
-    loop {
-        for event in eps[init].take_nat_events() {
-            match event {
-                NatEvent::PathEstablished { connect_id, path, .. } if connect_id == id => {
-                    return Ok((path, t0.elapsed().as_millis() as u64));
-                }
-                NatEvent::ConnectFailed {
-                    connect_id, error, ..
-                } if connect_id == id => {
-                    failed = Some(format!("ConnectFailed: {error:?}"));
-                }
-                _ => {}
-            }
-        }
-        if let Some(msg) = failed {
-            return Err(msg);
-        }
-        if Instant::now() >= until {
-            return Err(format!("wait_path timed out after {deadline:?}"));
-        }
-        let _ = drive_step(eps, init)?;
-    }
-}
-
 fn run_direct(
     name: &str,
     echoes: u64,
@@ -318,9 +325,9 @@ fn run_direct(
         let b_addr = b.listen()?;
         a.listen()?;
         let b_peer = b_addr.peer_id().clone();
-        let id = a.connect_addr(&b_addr)?;
+        let id = a.connect(&b_addr)?;
         let mut eps = [a, b];
-        let (path, path_ms) = wait_path_established(&mut eps, 0, id, PATH_DEADLINE)?;
+        let (path, path_ms) = wait_path_established(&mut eps, 0, &b_peer, id, PATH_DEADLINE)?;
         if !is_direct(&path) {
             return Err(format!("expected Direct*, got {}", path_kind(&path)).into());
         }
@@ -371,23 +378,30 @@ fn run_nopath(
         a.listen()?;
         let stranger = Ed25519Keypair::generate().peer_id();
         let id = a.connect(&stranger)?;
-        let path = a.wait_path(id, Duration::from_secs(2))?;
-        if path.is_some() {
-            return Err(format!("unexpected path {path:?}").into());
-        }
-        let events = a.take_nat_events();
-        let failed_ok = events.iter().any(|event| {
-            matches!(
-                event,
-                NatEvent::ConnectFailed {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut settled = None;
+        while Instant::now() < deadline {
+            match wait_duration(&mut a, deadline.saturating_duration_since(Instant::now()))
+                .map_err(|e| e.to_string())?
+            {
+                Some(EndpointEvent::ConnectSettled {
                     connect_id,
-                    error: NatError::NoPathAvailable,
+                    outcome,
                     ..
-                } if *connect_id == id
-            )
-        });
-        if !failed_ok {
-            return Err(format!("expected ConnectFailed/NoPathAvailable, got {events:?}").into());
+                }) if connect_id == id => {
+                    settled = Some(outcome);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        match settled {
+            Some(ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { .. })) => {}
+            Some(other) => {
+                return Err(format!("expected ConnectSettled/NoUsableRoute, got {other:?}").into());
+            }
+            None => return Err("connect did not settle with NoUsableRoute".into()),
         }
         drop(a);
         Ok(finish_ok(
@@ -399,7 +413,7 @@ fn run_nopath(
             0,
             0,
             Vec::new(),
-            "ConnectFailed/NoPathAvailable (expected)".into(),
+            "ConnectSettled/NoUsableRoute (expected)".into(),
         ))
     })();
     record_mem(mem_log, suite_t0, &format!("after-{name}"));
@@ -425,13 +439,13 @@ fn wait_reserved(
         if Instant::now() >= until {
             return Err(format!("responder did not reserve within {deadline:?}"));
         }
-        let _ = ep.next_event(SLICE).map_err(|e| format!("next_event: {e}"))?;
-        if ep
-            .take_nat_events()
-            .iter()
-            .any(|event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_peer))
-        {
-            return Ok(());
+        match wait_duration(ep, SLICE).map_err(|e| format!("wait: {e}"))? {
+            Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. }))
+                if relay == *relay_peer =>
+            {
+                return Ok(());
+            }
+            Some(_) | None => {}
         }
         if let Some(relay) = hop {
             relay.check()?;
@@ -514,7 +528,8 @@ fn run_circuit(
             .map_err(|e| format!("connect(peer): {e}"))?;
 
         let mut eps = [initiator, responder];
-        let (path, path_ms) = wait_path_established(&mut eps, 0, id, path_deadline).map_err(|e| {
+        let (path, path_ms) =
+            wait_path_established(&mut eps, 0, &responder_peer, id, path_deadline).map_err(|e| {
             let hop = local
                 .as_ref()
                 .and_then(|r| r.check().err())
