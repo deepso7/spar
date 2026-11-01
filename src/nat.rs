@@ -46,14 +46,7 @@ fn bind_on(
     transport: TransportKind,
     listen: &str,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(match transport {
-        TransportKind::Quic => builder
-            .listen_on(listen_multiaddr(listen, transport).map_err(|e| e.to_string())?)?
-            .bind()?,
-        TransportKind::Tcp => builder
-            .listen_on(listen_multiaddr(listen, transport).map_err(|e| e.to_string())?)?
-            .bind()?,
-    })
+    Ok(builder.listen_on(listen_multiaddr(listen, transport)?)?.bind()?)
 }
 
 fn nat_cfg(policy: ReservationPolicy, relay: Option<minip2p::PeerAddr>, force_relay: bool) -> NatConfig {

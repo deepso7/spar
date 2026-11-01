@@ -5,12 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, EndpointEvent, GossipsubError, GossipsubEvent, PublishError,
+    Endpoint, EndpointEvent, GossipsubError, GossipsubEvent, PublishError, GOSSIPSUB_PROTOCOL_IDS,
 };
-
-// minip2p 0.11 no longer re-exports the meshsub ids; they are wire constants.
-const MESHSUB_PROTOCOL_ID_V10: &str = "/meshsub/1.0.0";
-const MESHSUB_PROTOCOL_ID_V11: &str = "/meshsub/1.1.0";
 
 use crate::common::{
     listen_multiaddr, sample_mem, wait_duration, DialResult, MemSample, TransportKind, AGENT,
@@ -44,7 +40,7 @@ impl Stats {
 }
 
 fn is_pubsub_protocol(id: &str) -> bool {
-    matches!(id, MESHSUB_PROTOCOL_ID_V10 | MESHSUB_PROTOCOL_ID_V11)
+    GOSSIPSUB_PROTOCOL_IDS.contains(&id)
 }
 
 fn build_ep(transport: TransportKind) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {

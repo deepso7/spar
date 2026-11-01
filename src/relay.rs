@@ -13,7 +13,7 @@ use minip2p_relay::{
     StopMessage, StopMessageType, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID,
 };
 
-use crate::common::{Outbox, TransportKind};
+use crate::common::{Forwarder, TransportKind};
 
 /// Stream ids are per connection since minip2p 0.8, so a stream is (conn, stream).
 type Sid = (ConnectionId, StreamId);
@@ -32,7 +32,7 @@ struct Hop {
     pending: HashMap<Key, Pending>,
     hop_to_stop: HashMap<Key, Key>,
     bridge: HashMap<Key, Key>,
-    outbox: Outbox,
+    fwd: Forwarder,
 }
 
 fn hop_ok_reserve() -> Vec<u8> {
@@ -83,13 +83,13 @@ fn stop_connect(initiator: &PeerId) -> Vec<u8> {
 impl Hop {
     fn send(&mut self, ep: &mut Endpoint, key: &Key, data: impl Into<Bytes>) -> Result<(), String> {
         let (conn, stream) = key.1;
-        self.outbox
+        self.fwd
             .send(ep, conn, stream, data)
             .map_err(|e| e.to_string())
     }
 
     fn handle(&mut self, ep: &mut Endpoint, event: EndpointEvent) -> Result<(), String> {
-        self.outbox.observe(ep, &event);
+        self.fwd.observe(ep, &event);
         match event {
             EndpointEvent::StreamReady {
                 peer_id,
@@ -128,7 +128,7 @@ impl Hop {
                 ..
             } => {
                 if let Some((_, (c, s))) = self.bridge.get(&(peer_id, (conn_id, stream_id))).cloned() {
-                    let _ = self.outbox.close_write(ep, c, s);
+                    let _ = self.fwd.close_write(ep, c, s);
                 }
             }
             EndpointEvent::StreamClosed {
@@ -261,12 +261,12 @@ impl Hop {
         self.hop_buf.remove(key);
         if let Some(stop) = self.hop_to_stop.remove(key) {
             self.pending.remove(&stop);
-            self.outbox.forget(stop.1.0, stop.1.1);
+            self.fwd.forget(stop.1.0, stop.1.1);
             let _ = ep.reset_stream(stop.1.0, stop.1.1);
         }
         if let Some(other) = self.bridge.remove(key) {
             self.bridge.remove(&other);
-            self.outbox.forget(other.1.0, other.1.1);
+            self.fwd.forget(other.1.0, other.1.1);
             let _ = ep.reset_stream(other.1.0, other.1.1);
         }
     }

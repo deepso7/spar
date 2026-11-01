@@ -1,14 +1,14 @@
 //! Shared sync helpers. No async, no Tokio.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder, EndpointEvent,
-    EndpointWaitOutcome, Multiaddr, NatConfig, NatEvent, Path, PeerAddr, PeerId, Protocol,
-    ReservationPolicy, StreamId,
+    BindError, Bytes, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder,
+    EndpointEvent, EndpointWaitOutcome, Multiaddr, NatConfig, NatEvent, Path, PeerAddr, PeerId,
+    Protocol, ReservationPolicy, StreamId, StreamWriteError, StreamWriter, SwarmRuntimeError,
 };
 
 pub const AGENT: &str = "spar/0.1.7";
@@ -17,6 +17,9 @@ pub const STACK: &str = "minip2p-rs 0.11.1";
 pub const ECHO_PROTOCOL: &str = "/spar/echo/1.0.0";
 pub const FRAME_LEN: usize = 16;
 pub const MAX_RTT_SAMPLES: usize = 50_000;
+/// Wait guard while a client is blocked on its own pending write or on
+/// in-flight echoes; the events that unblock it wake the wait first.
+const BLOCKED_WAIT: Duration = Duration::from_millis(100);
 
 /// Wire transport for listen/dial/suite (must match on both sides).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,8 +95,8 @@ fn bind_endpoint(
         TransportKind::Quic if wants_dual_stack(bind) => {
             match make()
                 .listen_default()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
-                .and_then(|b| b.bind().map_err(Into::into))
+                .map_err(BindError::from)
+                .and_then(|b| b.bind())
             {
                 Ok(endpoint) => Ok(endpoint),
                 Err(err) => {
@@ -118,6 +121,12 @@ fn bind_endpoint(
         }
         TransportKind::Tcp => Ok(make().listen_on(listen_multiaddr(bind, transport)?)?.bind()?),
     }
+}
+
+/// A failed reset of a stream that already ended. 0.11.1 reports it only
+/// as transport detail text (`StreamResetFailed`), with no typed kind.
+fn is_reset_noise(err: &SwarmRuntimeError) -> bool {
+    format!("{err:?}").contains("StreamReset")
 }
 
 /// One ordered Endpoint wait. An already-passed absolute Instant drains once
@@ -167,8 +176,7 @@ pub fn wait_connect_settled(
                 ..
             }) if settled == connect_id => return Ok(outcome),
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     continue;
                 }
                 return Err(format!("swarm error while connecting: {err:?}").into());
@@ -216,8 +224,7 @@ fn wait_peer_ready_inner(
                 }
             }
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     continue;
                 }
                 return Err(format!("swarm error while waiting for identify: {err:?}").into());
@@ -252,8 +259,7 @@ fn wait_ping_rtt(
                 return Err("builtin ping timed out".into());
             }
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     continue;
                 }
                 return Err(format!("swarm error while pinging: {err:?}").into());
@@ -342,107 +348,105 @@ pub fn push_rtt_sample(samples: &mut Vec<u64>, rtt_us: u64, received: u64, strid
     }
 }
 
-/// Per-stream write queue for minip2p 0.10+'s partial-accept `send_stream`
-/// (ADR 0012): `Error::Full` hands back the unsent suffix, which must be resent
-/// before any later frame so echo framing stays intact. Sync, no allocation
-/// beyond the held tails.
-#[derive(Default)]
-pub struct Outbox {
-    q: HashMap<(ConnectionId, StreamId), (VecDeque<Bytes>, bool)>,
+/// Echo and relay-bridge writes on minip2p's [`StreamWriter`], which holds
+/// at most one pending write per stream. A forwarder can receive more for a
+/// stream while that write is pending; those bytes queue here and go out,
+/// FIN last, once the writer reports the pending write accepted. Callers
+/// bound what they queue (spar's dialers cap in-flight echoes).
+pub struct Forwarder {
+    writer: StreamWriter,
+    /// Bytes behind the pending write, and whether a FIN follows them.
+    backlog: HashMap<(ConnectionId, StreamId), (Vec<u8>, bool)>,
 }
 
-impl Outbox {
-    /// Queue `data` behind anything held for the stream and push what fits.
+impl Default for Forwarder {
+    fn default() -> Self {
+        Self {
+            writer: StreamWriter::new(FORWARD_BUDGET),
+            backlog: HashMap::new(),
+        }
+    }
+}
+
+/// Bytes of unsent tails the forwarder's writer may hold across streams.
+const FORWARD_BUDGET: usize = 64 * 1024 * 1024;
+
+impl Forwarder {
     pub fn send(
         &mut self,
         ep: &mut Endpoint,
         conn: ConnectionId,
         stream: StreamId,
         data: impl Into<Bytes>,
-    ) -> Result<(), minip2p::Error> {
-        self.q
-            .entry((conn, stream))
-            .or_default()
-            .0
-            .push_back(data.into());
-        self.flush(ep, conn, stream)
+    ) -> Result<(), StreamWriteError> {
+        if let Some((buf, _)) = self.backlog.get_mut(&(conn, stream)) {
+            buf.extend_from_slice(&data.into());
+            return Ok(());
+        }
+        match self.writer.write(ep, conn, stream, data) {
+            Ok(_) => Ok(()),
+            Err(StreamWriteError::Busy { unsent, .. }) => {
+                self.backlog
+                    .insert((conn, stream), (unsent.to_vec(), false));
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
-    /// Half-close once every held byte has been accepted.
+    /// Half-close once everything sent so far has been accepted.
     pub fn close_write(
         &mut self,
         ep: &mut Endpoint,
         conn: ConnectionId,
         stream: StreamId,
-    ) -> Result<(), minip2p::Error> {
-        match self.q.get_mut(&(conn, stream)) {
-            Some(entry) if !entry.0.is_empty() => {
-                entry.1 = true;
-                Ok(())
-            }
-            _ => {
-                self.q.remove(&(conn, stream));
-                ep.close_stream_write(conn, stream)
-            }
+    ) -> Result<(), StreamWriteError> {
+        if let Some((_, close)) = self.backlog.get_mut(&(conn, stream)) {
+            *close = true;
+            return Ok(());
         }
-    }
-
-    pub fn pending(&self, conn: ConnectionId, stream: StreamId) -> bool {
-        self.q.get(&(conn, stream)).is_some_and(|e| !e.0.is_empty())
+        self.writer.close_write(ep, conn, stream)
     }
 
     pub fn forget(&mut self, conn: ConnectionId, stream: StreamId) {
-        self.q.remove(&(conn, stream));
+        self.writer.forget(conn, stream);
+        self.backlog.remove(&(conn, stream));
     }
 
-    pub fn flush(
-        &mut self,
-        ep: &mut Endpoint,
-        conn: ConnectionId,
-        stream: StreamId,
-    ) -> Result<(), minip2p::Error> {
-        let key = (conn, stream);
-        let Some(entry) = self.q.get_mut(&key) else {
-            return Ok(());
-        };
-        while let Some(front) = entry.0.pop_front() {
-            match ep.send_stream(conn, stream, front) {
-                Ok(()) => {}
-                Err(minip2p::Error::Full { unsent, .. }) => {
-                    entry.0.push_front(unsent);
-                    return Ok(());
-                }
-                Err(err) => {
-                    self.q.remove(&key);
-                    return Err(err);
-                }
-            }
-        }
-        let close = entry.1;
-        self.q.remove(&key);
-        if close {
-            ep.close_stream_write(conn, stream)?;
-        }
-        Ok(())
-    }
-
-    /// Follow one event: resend on Writable, drop tails of ended streams.
+    /// Follow every event: the writer resends on Writable; an accepted write
+    /// releases the stream's backlog; ended streams drop what they held.
     pub fn observe(&mut self, ep: &mut Endpoint, event: &EndpointEvent) {
-        match event {
-            EndpointEvent::StreamWritable {
-                conn_id, stream_id, ..
-            } => {
-                let _ = self.flush(ep, *conn_id, *stream_id);
+        if let Some(done) = self.writer.observe(ep, event)
+            && let Some((buf, close)) = self.backlog.remove(&(done.conn_id, done.stream_id))
+        {
+            let (conn, stream) = (done.conn_id, done.stream_id);
+            let mut sent = Ok(());
+            if !buf.is_empty() {
+                sent = self.writer.write(ep, conn, stream, buf).map(drop);
             }
+            if close && sent.is_ok() {
+                sent = self.writer.close_write(ep, conn, stream);
+            }
+            if let Err(err) = sent {
+                if !err.is_stream_gone() {
+                    eprintln!("[spar] forward conn={conn} stream={stream} failed: {err}");
+                }
+                self.forget(conn, stream);
+                let _ = ep.reset_stream(conn, stream);
+            }
+        }
+        match event {
             EndpointEvent::StreamClosed {
                 conn_id, stream_id, ..
             }
             | EndpointEvent::StreamWriteStopped {
                 conn_id, stream_id, ..
-            } => self.forget(*conn_id, *stream_id),
+            } => {
+                self.backlog.remove(&(*conn_id, *stream_id));
+            }
             EndpointEvent::ConnectionClosed { conn_id, .. }
             | EndpointEvent::ConnectionReplaced { old: conn_id, .. } => {
-                self.q.retain(|(c, _), _| c != conn_id);
+                self.backlog.retain(|(c, _), _| c != conn_id);
             }
             _ => {}
         }
@@ -674,8 +678,7 @@ fn wait_stream_ready(
                 return Ok(());
             }
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     continue;
                 }
                 return Err(format!("swarm error while opening stream: {err:?}").into());
@@ -694,11 +697,6 @@ fn open_echo(
     let (conn, stream) = endpoint.open_stream(peer, ECHO_PROTOCOL)?;
     wait_stream_ready(endpoint, peer, conn, stream, Duration::from_secs(15), track)?;
     Ok((conn, stream))
-}
-
-fn stream_gone(err: &dyn std::fmt::Display) -> bool {
-    let msg = err.to_string();
-    msg.contains("is not active") || msg.contains("StreamNotFound")
 }
 
 fn run_dial_collect_inner(
@@ -768,21 +766,23 @@ fn run_dial_collect_inner(
         128
     };
 
-    let mut outbox = Outbox::default();
+    // One frame in flight at a time: a Full tail stays with the writer,
+    // which resends it on StreamWritable; the next frame waits for it.
+    let mut writer = StreamWriter::new(frame_len);
     loop {
-        outbox.flush(&mut endpoint, conn, stream)?;
-        let blocked = outstanding.len() >= max_outstanding || outbox.pending(conn, stream);
+        let blocked = outstanding.len() >= max_outstanding || writer.is_pending(conn, stream);
         let wait_for = if closing {
             Instant::now() + Duration::from_secs(5)
         } else if blocked {
-            Instant::now() + Duration::from_millis(5)
+            // Echoes and StreamWritable wake the wait; this is only a guard.
+            Instant::now() + BLOCKED_WAIT
         } else {
             next_send
         };
 
         let event = wait_until(&mut endpoint, wait_for)?;
         if let Some(ev) = &event {
-            outbox.observe(&mut endpoint, ev);
+            writer.observe(&mut endpoint, ev);
         }
         match event {
             None => {
@@ -793,11 +793,11 @@ fn run_dial_collect_inner(
                     .max_echo_duration
                     .is_some_and(|d| echo_start.elapsed() >= d);
                 if sent >= opts.count || duration_done {
-                    outbox.close_write(&mut endpoint, conn, stream)?;
+                    writer.close_write(&mut endpoint, conn, stream)?;
                     closing = true;
                     continue;
                 }
-                if outstanding.len() >= max_outstanding || outbox.pending(conn, stream) {
+                if outstanding.len() >= max_outstanding || writer.is_pending(conn, stream) {
                     continue;
                 }
                 sent += 1;
@@ -807,10 +807,8 @@ fn run_dial_collect_inner(
                     frame.extend(std::iter::repeat_n(0xAB, opts.payload));
                 }
                 let len = frame.len() as u64;
-                // 0.10+: a Full write keeps its unsent tail in the outbox and
-                // resends it before the next frame (StreamWritable / next loop).
-                outbox
-                    .send(&mut endpoint, conn, stream, frame)
+                writer
+                    .write(&mut endpoint, conn, stream, frame)
                     .map_err(|err| format!("send_stream failed: {err}"))?;
                 bytes_sent += len;
                 outstanding.insert(seq, Instant::now());
@@ -912,31 +910,30 @@ pub fn run_reconnect_once(
     let mut closing = false;
     let frame_len = FRAME_LEN + payload;
     let t0 = Instant::now();
-    let mut outbox = Outbox::default();
+    let mut writer = StreamWriter::new(frame_len);
 
     loop {
-        outbox.flush(&mut endpoint, conn, stream)?;
         let wait_for = if closing {
             Instant::now() + Duration::from_secs(5)
-        } else if outbox.pending(conn, stream) {
-            Instant::now() + Duration::from_millis(2)
+        } else if writer.is_pending(conn, stream) {
+            Instant::now() + BLOCKED_WAIT
         } else {
             next_send
         };
         let event = wait_until(&mut endpoint, wait_for)?;
         if let Some(ev) = &event {
-            outbox.observe(&mut endpoint, ev);
+            writer.observe(&mut endpoint, ev);
         }
         match event {
             None => {
                 if closing {
                     break;
                 }
-                if outbox.pending(conn, stream) {
+                if writer.is_pending(conn, stream) {
                     continue;
                 }
                 if sent >= echoes {
-                    outbox.close_write(&mut endpoint, conn, stream)?;
+                    writer.close_write(&mut endpoint, conn, stream)?;
                     closing = true;
                     continue;
                 }
@@ -945,8 +942,8 @@ pub fn run_reconnect_once(
                 if payload > 0 {
                     frame.extend(std::iter::repeat_n(0xCD, payload));
                 }
-                outbox
-                    .send(&mut endpoint, conn, stream, frame)
+                writer
+                    .write(&mut endpoint, conn, stream, frame)
                     .map_err(|err| format!("send_stream failed: {err}"))?;
                 outstanding.insert(sent, Instant::now());
                 next_send = Instant::now();
@@ -1009,13 +1006,13 @@ pub fn run_listen_loop(
 
     // HashMap keyed by peer; streams are (conn, stream) because StreamId is per-connection.
     let mut streams: HashMap<PeerId, HashSet<(ConnectionId, StreamId)>> = HashMap::new();
-    let mut outbox = Outbox::default();
+    let mut fwd = Forwarder::default();
     while !stop.load(Ordering::SeqCst) {
         let Some(event) = wait_duration(&mut endpoint, Duration::from_millis(100))? else {
             continue;
         };
-        outbox.observe(&mut endpoint, &event);
-        handle_listen_echo(&mut endpoint, event, &mut streams, &mut outbox);
+        fwd.observe(&mut endpoint, &event);
+        handle_listen_echo(&mut endpoint, event, &mut streams, &mut fwd);
     }
     Ok(())
 }
@@ -1024,7 +1021,7 @@ fn handle_listen_echo(
     endpoint: &mut Endpoint,
     event: EndpointEvent,
     streams: &mut HashMap<PeerId, HashSet<(ConnectionId, StreamId)>>,
-    outbox: &mut Outbox,
+    fwd: &mut Forwarder,
 ) {
     match event {
         EndpointEvent::StreamReady {
@@ -1054,9 +1051,12 @@ fn handle_listen_echo(
             if !active {
                 return;
             }
-            // Echo the owned Bytes back; a Full tail is held in the outbox.
-            if let Err(err) = outbox.send(endpoint, conn_id, stream_id, data) {
-                eprintln!("[listen] echo send failed: {err}");
+            // Echo the owned Bytes back; the forwarder holds what does not fit.
+            if let Err(err) = fwd.send(endpoint, conn_id, stream_id, data) {
+                if !err.is_stream_gone() {
+                    eprintln!("[listen] echo send failed: {err}");
+                }
+                fwd.forget(conn_id, stream_id);
                 if let Some(set) = streams.get_mut(&peer_id) {
                     set.remove(&(conn_id, stream_id));
                 }
@@ -1072,7 +1072,7 @@ fn handle_listen_echo(
                 .get(&peer_id)
                 .is_some_and(|s| s.contains(&(conn_id, stream_id)))
             {
-                let _ = outbox.close_write(endpoint, conn_id, stream_id);
+                let _ = fwd.close_write(endpoint, conn_id, stream_id);
                 if let Some(set) = streams.get_mut(&peer_id) {
                     set.remove(&(conn_id, stream_id));
                 }
@@ -1307,8 +1307,7 @@ fn wait_nat_path(
                 other => return Err(format!("connect failed: {other:?}").into()),
             },
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     continue;
                 }
                 return Err(format!("swarm error while waiting for path: {err:?}").into());
@@ -1363,7 +1362,7 @@ pub fn run_listen_relay(
     let until = Instant::now() + Duration::from_secs(20);
     let mut reserved = false;
     let mut streams: HashMap<PeerId, HashSet<(ConnectionId, StreamId)>> = HashMap::new();
-    let mut outbox = Outbox::default();
+    let mut fwd = Forwarder::default();
     while Instant::now() < until && !reserved {
         match wait_until(&mut endpoint, until)? {
             Some(EndpointEvent::Nat(NatEvent::RelayReserved { .. })) => {
@@ -1372,8 +1371,8 @@ pub fn run_listen_relay(
                 reserved = true;
             }
             Some(event) => {
-                outbox.observe(&mut endpoint, &event);
-                handle_listen_echo(&mut endpoint, event, &mut streams, &mut outbox)
+                fwd.observe(&mut endpoint, &event);
+                handle_listen_echo(&mut endpoint, event, &mut streams, &mut fwd)
             }
             None => break,
         }
@@ -1386,8 +1385,8 @@ pub fn run_listen_relay(
         let Some(event) = wait_duration(&mut endpoint, Duration::from_millis(100))? else {
             continue;
         };
-        outbox.observe(&mut endpoint, &event);
-        handle_listen_echo(&mut endpoint, event, &mut streams, &mut outbox);
+        fwd.observe(&mut endpoint, &event);
+        handle_listen_echo(&mut endpoint, event, &mut streams, &mut fwd);
     }
     Ok(())
 }
@@ -1537,11 +1536,11 @@ fn run_dial_nat_inner(
     let frame_len = FRAME_LEN + payload;
     let echo_t0 = Instant::now();
     let us = endpoint.peer_id().to_string();
-    let mut outbox = Outbox::default();
+    let mut writer = StreamWriter::new(frame_len);
 
     while received < count && fatal.is_none() {
         if reopen {
-            outbox.forget(conn, stream);
+            writer.forget(conn, stream);
             let _ = endpoint.abandon_stream(conn, stream);
             sent = 0;
             received = 0;
@@ -1579,7 +1578,7 @@ fn run_dial_nat_inner(
         }
         let event = wait_until(&mut endpoint, next_send)?;
         if let Some(ev) = &event {
-            outbox.observe(&mut endpoint, ev);
+            writer.observe(&mut endpoint, ev);
         }
         match event {
             Some(EndpointEvent::Nat(ev)) => {
@@ -1605,14 +1604,8 @@ fn run_dial_nat_inner(
                 reopen = true;
             }
             None => {
-                if let Err(err) = outbox.flush(&mut endpoint, conn, stream) {
-                    if err.is_stream_gone() {
-                        reopen = true;
-                    } else {
-                        fatal = Some(format!("send_stream: {err}"));
-                    }
-                } else if outbox.pending(conn, stream) {
-                    next_send = Instant::now() + Duration::from_millis(2);
+                if writer.is_pending(conn, stream) {
+                    next_send = Instant::now() + BLOCKED_WAIT;
                 } else if sent >= count {
                     next_send = Instant::now() + Duration::from_millis(50);
                 } else {
@@ -1621,13 +1614,13 @@ fn run_dial_nat_inner(
                     if payload > 0 {
                         frame.extend(std::iter::repeat_n(0xCD, payload));
                     }
-                    match outbox.send(&mut endpoint, conn, stream, frame) {
-                        Ok(()) => {
+                    match writer.write(&mut endpoint, conn, stream, frame) {
+                        Ok(_) => {
                             outstanding.insert(sent, Instant::now());
                             next_send = Instant::now() + interval;
                             eprintln!("[dial] echo seq={sent}/{count} path={}", track.last_path);
                         }
-                        Err(err) if err.is_stream_gone() || stream_gone(&err) => {
+                        Err(err) if err.is_stream_gone() => {
                             sent -= 1;
                             reopen = true;
                         }
@@ -1657,8 +1650,7 @@ fn run_dial_nat_inner(
                 }
             }
             Some(EndpointEvent::Error(err)) => {
-                let msg = format!("{err:?}");
-                if msg.contains("StreamReset") {
+                if is_reset_noise(&err) {
                     eprintln!("[dial] swarm error (ignored): {err:?}");
                 } else {
                     fatal = Some(format!("swarm error: {err:?}"));
