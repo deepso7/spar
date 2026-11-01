@@ -5,15 +5,19 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId};
+use minip2p::{
+    Bytes, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
+};
 use minip2p_relay::{
     decode_frame, encode_frame, FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status,
     StopMessage, StopMessageType, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID,
 };
 
-use crate::common::TransportKind;
+use crate::common::{Outbox, TransportKind};
 
-type Key = (PeerId, StreamId);
+/// Stream ids are per connection since minip2p 0.8, so a stream is (conn, stream).
+type Sid = (ConnectionId, StreamId);
+type Key = (PeerId, Sid);
 
 struct Pending {
     hop: Key,
@@ -28,6 +32,7 @@ struct Hop {
     pending: HashMap<Key, Pending>,
     hop_to_stop: HashMap<Key, Key>,
     bridge: HashMap<Key, Key>,
+    outbox: Outbox,
 }
 
 fn hop_ok_reserve() -> Vec<u8> {
@@ -76,45 +81,62 @@ fn stop_connect(initiator: &PeerId) -> Vec<u8> {
 }
 
 impl Hop {
+    fn send(&mut self, ep: &mut Endpoint, key: &Key, data: impl Into<Bytes>) -> Result<(), String> {
+        let (conn, stream) = key.1;
+        self.outbox
+            .send(ep, conn, stream, data)
+            .map_err(|e| e.to_string())
+    }
+
     fn handle(&mut self, ep: &mut Endpoint, event: EndpointEvent) -> Result<(), String> {
+        self.outbox.observe(ep, &event);
         match event {
             EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: false,
                 ..
             } if protocol_id == HOP_PROTOCOL_ID => {
-                self.hop_buf.entry((peer_id, stream_id)).or_default();
+                self.hop_buf.entry((peer_id, (conn_id, stream_id))).or_default();
             }
             EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: true,
                 ..
             } if protocol_id == STOP_PROTOCOL_ID => {
-                let key = (peer_id.clone(), stream_id);
+                let key = (peer_id, (conn_id, stream_id));
                 let bytes = stop_connect(&self.pending.get(&key).ok_or("STOP ready without CONNECT")?.hop.0);
-                ep.send_stream(&peer_id, stream_id, bytes)
+                self.send(ep, &key, bytes)
                     .map_err(|e| format!("send STOP CONNECT: {e}"))?;
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
                 ..
-            } => self.on_data(ep, (peer_id, stream_id), data)?,
+            } => self.on_data(ep, (peer_id, (conn_id, stream_id)), data)?,
             EndpointEvent::StreamRemoteWriteClosed {
-                peer_id, stream_id, ..
+                peer_id,
+                conn_id,
+                stream_id,
+                ..
             } => {
-                if let Some((other, sid)) = self.bridge.get(&(peer_id, stream_id)).cloned() {
-                    let _ = ep.close_stream_write(&other, sid);
+                if let Some((_, (c, s))) = self.bridge.get(&(peer_id, (conn_id, stream_id))).cloned() {
+                    let _ = self.outbox.close_write(ep, c, s);
                 }
             }
             EndpointEvent::StreamClosed {
-                peer_id, stream_id, ..
-            } => self.drop_stream(ep, &(peer_id, stream_id)),
+                peer_id,
+                conn_id,
+                stream_id,
+                ..
+            } => self.drop_stream(ep, &(peer_id, (conn_id, stream_id))),
             EndpointEvent::ConnectionClosed { peer_id, .. } => {
                 let dead: Vec<_> = self
                     .bridge
@@ -135,26 +157,26 @@ impl Hop {
         Ok(())
     }
 
-    fn on_data(&mut self, ep: &mut Endpoint, key: Key, data: Vec<u8>) -> Result<(), String> {
-        if let Some((other, sid)) = self.bridge.get(&key).cloned() {
-            ep.send_stream(&other, sid, data)
+    fn on_data(&mut self, ep: &mut Endpoint, key: Key, data: Bytes) -> Result<(), String> {
+        if let Some(other) = self.bridge.get(&key).cloned() {
+            self.send(ep, &other, data)
                 .map_err(|e| format!("bridge forward: {e}"))?;
             return Ok(());
         }
         if let Some(stop) = self.hop_to_stop.get(&key).cloned() {
             if let Some(p) = self.pending.get_mut(&stop) {
-                p.hop_trailing.extend(data);
+                p.hop_trailing.extend_from_slice(&data);
             }
             return Ok(());
         }
         if self.pending.contains_key(&key) {
-            return self.on_stop(ep, key, data);
+            return self.on_stop(ep, key, &data);
         }
         let buf = match self.hop_buf.get_mut(&key) {
             Some(b) => b,
             None => return Ok(()),
         };
-        buf.extend(data);
+        buf.extend_from_slice(&data);
         let FrameDecode::Complete { payload, consumed } = decode_frame(buf) else {
             return Ok(());
         };
@@ -167,7 +189,7 @@ impl Hop {
                     return Err("trailing bytes after RESERVE".into());
                 }
                 self.reserved.insert(key.0.clone());
-                ep.send_stream(&key.0, key.1, hop_ok_reserve())
+                self.send(ep, &key, hop_ok_reserve())
                     .map_err(|e| format!("RESERVE reply: {e}"))?;
             }
             HopMessageType::Connect => {
@@ -179,7 +201,7 @@ impl Hop {
                 let target =
                     PeerId::from_bytes(&raw).map_err(|_| "CONNECT invalid peer id")?;
                 if !self.reserved.contains(&target) {
-                    ep.send_stream(&key.0, key.1, hop_status(Status::NoReservation))
+                    self.send(ep, &key, hop_status(Status::NoReservation))
                         .map_err(|e| format!("CONNECT refuse: {e}"))?;
                     return Ok(());
                 }
@@ -202,10 +224,10 @@ impl Hop {
         Ok(())
     }
 
-    fn on_stop(&mut self, ep: &mut Endpoint, key: Key, data: Vec<u8>) -> Result<(), String> {
+    fn on_stop(&mut self, ep: &mut Endpoint, key: Key, data: &[u8]) -> Result<(), String> {
         {
             let p = self.pending.get_mut(&key).expect("pending STOP");
-            p.stop_buf.extend(data);
+            p.stop_buf.extend_from_slice(data);
             if !matches!(decode_frame(&p.stop_buf), FrameDecode::Complete { .. }) {
                 return Ok(());
             }
@@ -220,14 +242,14 @@ impl Hop {
             return Err("expected STOP STATUS:OK".into());
         }
         let stop_trailing = p.stop_buf[consumed..].to_vec();
-        ep.send_stream(&p.hop.0, p.hop.1, hop_status(Status::Ok))
+        self.send(ep, &p.hop, hop_status(Status::Ok))
             .map_err(|e| format!("HOP OK: {e}"))?;
         if !p.hop_trailing.is_empty() {
-            ep.send_stream(&key.0, key.1, p.hop_trailing)
+            self.send(ep, &key, p.hop_trailing)
                 .map_err(|e| format!("pipeline to dest: {e}"))?;
         }
         if !stop_trailing.is_empty() {
-            ep.send_stream(&p.hop.0, p.hop.1, stop_trailing)
+            self.send(ep, &p.hop, stop_trailing)
                 .map_err(|e| format!("pipeline to src: {e}"))?;
         }
         self.bridge.insert(p.hop.clone(), key.clone());
@@ -239,11 +261,13 @@ impl Hop {
         self.hop_buf.remove(key);
         if let Some(stop) = self.hop_to_stop.remove(key) {
             self.pending.remove(&stop);
-            let _ = ep.reset_stream(&stop.0, stop.1);
+            self.outbox.forget(stop.1.0, stop.1.1);
+            let _ = ep.reset_stream(stop.1.0, stop.1.1);
         }
         if let Some(other) = self.bridge.remove(key) {
             self.bridge.remove(&other);
-            let _ = ep.reset_stream(&other.0, other.1);
+            self.outbox.forget(other.1.0, other.1.1);
+            let _ = ep.reset_stream(other.1.0, other.1.1);
         }
     }
 }
@@ -265,11 +289,13 @@ impl RelayServer {
             match transport {
                 TransportKind::Quic => b
                     .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-                    .and_then(|b| b.bind())
+                    .map_err(|e| format!("relay bind: {e}"))?
+                    .bind()
                     .map_err(|e| format!("relay bind: {e}"))?,
                 TransportKind::Tcp => b
                     .listen_on("/ip4/127.0.0.1/tcp/0")
-                    .and_then(|b| b.bind())
+                    .map_err(|e| format!("relay bind: {e}"))?
+                    .bind()
                     .map_err(|e| format!("relay bind: {e}"))?,
             }
         };
@@ -291,7 +317,7 @@ impl RelayServer {
                             break;
                         }
                     }
-                    Ok(EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted) => {}
+                    Ok(_) => {}
                     Err(e) => {
                         *sink.lock().expect("relay err") = Some(format!("relay endpoint: {e}"));
                         break;

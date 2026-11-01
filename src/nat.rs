@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectFailure, ConnectId, ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, NatConfig,
+    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, NatConfig,
     NatEvent, Path, PeerAddr, PeerId, ReservationPolicy, StreamId,
 };
 
@@ -23,14 +23,15 @@ const ECHO_DEADLINE: Duration = Duration::from_secs(15);
 
 fn path_kind(path: &Path) -> String {
     match path {
-        Path::DirectDialed => "DirectDialed".into(),
-        Path::DirectPunched => "DirectPunched".into(),
+        Path::Direct => "DirectDialed".into(),
+        Path::Punched => "DirectPunched".into(),
         Path::Relayed { relay } => format!("Relayed({relay})"),
+        other => format!("{other:?}"),
     }
 }
 
 fn is_direct(path: &Path) -> bool {
-    matches!(path, Path::DirectDialed | Path::DirectPunched)
+    matches!(path, Path::Direct | Path::Punched)
 }
 
 fn bind(
@@ -67,11 +68,11 @@ fn nat_cfg(policy: ReservationPolicy, relay: Option<minip2p::PeerAddr>, force_re
     c
 }
 
-fn nat_builder(policy: ReservationPolicy) -> minip2p::EndpointBuilder {
-    Endpoint::builder()
-        .agent_version(AGENT)
-        .protocol(ECHO_PROTOCOL)
-        .nat_config(nat_cfg(policy, None, false))
+/// Direct-path endpoint. minip2p 0.11 refuses a NatConfig with no relay and
+/// no AutoNAT server (`NatConfigError`), so the direct/no-path scenarios leave
+/// NAT unconfigured and read the path from `ConnectSettled` / `path()`.
+fn nat_builder() -> minip2p::EndpointBuilder {
+    Endpoint::builder().agent_version(AGENT).protocol(ECHO_PROTOCOL)
 }
 
 fn record_mem(log: &Arc<Mutex<Vec<(MemSample, String)>>>, t0: Instant, label: &str) {
@@ -174,6 +175,7 @@ fn wait_path_established(
                     ConnectOutcome::Cancelled => {
                         failed = Some("ConnectSettled cancelled".into());
                     }
+                    other => failed = Some(format!("ConnectSettled: {other:?}")),
                 },
                 _ => {}
             }
@@ -195,13 +197,13 @@ fn echo_n(
 ) -> Result<(u64, u64, u64, u64, Vec<u64>), String> {
     let resp_peer = eps[resp].peer_id().clone();
     let init_peer = eps[init].peer_id().clone();
-    let stream = eps[init]
+    let (conn, stream) = eps[init]
         .open_stream(&resp_peer, ECHO_PROTOCOL)
         .map_err(|e| format!("open_stream: {e}"))?;
 
     let until = Instant::now() + Duration::from_secs(10);
     let mut init_ready = false;
-    let mut resp_stream: Option<StreamId> = None;
+    let mut resp_stream: Option<(ConnectionId, StreamId)> = None;
     while !init_ready || resp_stream.is_none() {
         if Instant::now() >= until {
             return Err("echo stream never became ready".into());
@@ -210,12 +212,14 @@ fn echo_n(
         for ev in &step[init] {
             if let EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: true,
                 ..
             } = ev
                 && *peer_id == resp_peer
+                && *conn_id == conn
                 && *stream_id == stream
                 && protocol_id == ECHO_PROTOCOL
             {
@@ -225,6 +229,7 @@ fn echo_n(
         for ev in &step[resp] {
             if let EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: false,
@@ -233,11 +238,11 @@ fn echo_n(
                 && *peer_id == init_peer
                 && protocol_id == ECHO_PROTOCOL
             {
-                resp_stream = Some(*stream_id);
+                resp_stream = Some((*conn_id, *stream_id));
             }
         }
     }
-    let resp_stream = resp_stream.expect("responder stream");
+    let (resp_conn, resp_stream) = resp_stream.expect("responder stream");
 
     let mut frames = FrameBuf::default();
     let mut outstanding: HashMap<u64, Instant> = HashMap::new();
@@ -258,7 +263,7 @@ fn echo_n(
             let frame = encode_header(sent, t0.elapsed().as_millis() as u64);
             let len = frame.len() as u64;
             eps[init]
-                .send_stream(&resp_peer, stream, frame)
+                .send_stream(conn, stream, frame)
                 .map_err(|e| format!("send_stream seq {sent}: {e}"))?;
             bytes_sent += len;
             outstanding.insert(sent, Instant::now());
@@ -267,26 +272,30 @@ fn echo_n(
         for ev in &step[resp] {
             if let EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
                 ..
             } = ev
                 && *peer_id == init_peer
+                && *conn_id == resp_conn
                 && *stream_id == resp_stream
             {
                 eps[resp]
-                    .send_stream(&init_peer, resp_stream, data.clone())
+                    .send_stream(resp_conn, resp_stream, data.clone())
                     .map_err(|e| format!("responder echo send: {e}"))?;
             }
         }
         for ev in &step[init] {
             if let EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
                 ..
             } = ev
                 && *peer_id == resp_peer
+                && *conn_id == conn
                 && *stream_id == stream
             {
                 bytes_recv += data.len() as u64;
@@ -320,8 +329,8 @@ fn run_direct(
     record_mem(mem_log, suite_t0, &format!("before-{name}"));
     let t_scen = Instant::now();
     let result = (|| -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
-        let mut a = bind(nat_builder(ReservationPolicy::Always), transport)?;
-        let mut b = bind(nat_builder(ReservationPolicy::Always), transport)?;
+        let mut a = bind(nat_builder(), transport)?;
+        let mut b = bind(nat_builder(), transport)?;
         let b_addr = b.listen()?;
         a.listen()?;
         let b_peer = b_addr.peer_id().clone();
@@ -374,7 +383,7 @@ fn run_nopath(
     record_mem(mem_log, suite_t0, &format!("before-{name}"));
     let t_scen = Instant::now();
     let result = (|| -> Result<DialResult, Box<dyn std::error::Error + Send + Sync>> {
-        let mut a = bind(nat_builder(ReservationPolicy::Always), transport)?;
+        let mut a = bind(nat_builder(), transport)?;
         a.listen()?;
         let stranger = Ed25519Keypair::generate().peer_id();
         let id = a.connect(&stranger)?;
